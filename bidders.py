@@ -435,3 +435,93 @@ class RandomBidder(BaseBidder):
         return random.uniform(0.0, cap)
 
 
+_PARAM_RANGES = {
+    "PositiveMarginBidder": {
+        "beta": (0.5, 2.5),
+        "min_bid": (0.01, 1.0),
+    },
+    "MarginPlusSafetyBidder": {
+        "beta": (0.5, 2.5),
+        "margin": (0.0, 4.0),
+    },
+    "BudgetPacedMarginBidder": {
+        "beta": (0.5, 2.5),
+        "c": (0.8, 2.0),
+        "top_k": (1, 5),
+    },
+    "TopKSpecialistBidder": {
+        "beta": (0.5, 2.0),
+        "top_k": (1, 5),
+        "margin": (0.0, 2.0),
+    },
+    "FlatFractionBidder": {
+        "f": (0.3, 1.5),
+    },
+    "DescendingAggressionBidder": {
+        "beta": (0.5, 2.0),
+        "f_start": (0.7, 1.0),
+        "f_end": (0.1, 0.4),
+    },
+    "SnipeBidder": {
+        "beta": (0.5, 2.0),
+        "snipe_from_rank": (4, 8),
+        "aggression": (1.0, 2.5),
+    },
+    "RandomBidder": {
+        "max_fraction": (0.2, 0.8),
+    },
+}
+
+
+def build_opponent_pool(
+    n_opponents: int,
+    budget: float,
+    seed: Optional[int] = None,
+    budget_noise: float = 0.2,
+) -> List[BaseBidder]:
+    """
+    Builds a diverse pool of randomized heuristic opponents.
+
+    Cycles through all 8 bidder types in round-robin order so every
+    type is always represented. Parameters are sampled from _PARAM_RANGES.
+
+    Parameters
+    ----------
+    n_opponents  : number of opponent bidders to create
+    budget       : base budget (each bidder gets budget * U(1 ± noise))
+    seed         : random seed for reproducibility
+    budget_noise : fractional variation on per-bidder budget
+    """
+    rng = random.Random(seed)
+
+    bidder_classes = [
+        PositiveMarginBidder,
+        MarginPlusSafetyBidder,
+        BudgetPacedMarginBidder,
+        TopKSpecialistBidder,
+        FlatFractionBidder,
+        DescendingAggressionBidder,
+        SnipeBidder,
+        RandomBidder,
+    ]
+
+    bidders: List[BaseBidder] = []
+
+    for i in range(n_opponents):
+        bidder_id = i + 1
+        cls = bidder_classes[i % len(bidder_classes)]
+        ranges = _PARAM_RANGES[cls.__name__]
+
+        bgt = budget * rng.uniform(1.0 - budget_noise, 1.0 + budget_noise)
+
+        params: Dict = {}
+        for param, bounds in ranges.items():
+            lo, hi = bounds
+            if isinstance(lo, int) and isinstance(hi, int):
+                params[param] = rng.randint(lo, hi)
+            else:
+                params[param] = rng.uniform(lo, hi)
+
+        bidders.append(cls(bidder_id=bidder_id, budget=bgt, **params))
+
+    return bidders
