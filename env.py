@@ -12,10 +12,15 @@ import numpy as np
 class Item:
     """Auctionable item with market value and bid history."""
 
-    def __init__(self, name: str, value: int):
+    def __init__(self, name: str, value: int, rank: int = 0):
         self.name = name
         self.value = value  # Market value (e.g., list price, estimated worth)
+        self.rank = rank
         self.bids: List[float] = []  # Bid amounts placed so far for this item
+
+    def get_value(self, mode: str = "linear") -> float:
+        """Return item value under the given valuation *mode*."""
+        return float(self.value)
 
 
 class Agent:
