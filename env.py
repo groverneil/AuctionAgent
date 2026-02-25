@@ -5,7 +5,7 @@ Items are presented in random order. Turn-based: each step = one agent places
 a bid or drops out. Agents accumulate reward (weight/priority) for items won.
 Auction ends when all items have been bid on.
 """
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple, Union
 import numpy as np
 
 
@@ -72,6 +72,8 @@ class AuctionEnvironment:
         self.rng = rng or np.random.default_rng()
         self.item_order: List[Item] = []  # Shuffled at reset; order items are presented
         self.current_round: int = 0  # Index of item currently being auctioned
+        self.current_bidder_idx: int = 0  # Which agent is to act (within current round)
+        self.dropped_this_round: set = set()  # Agent indices who dropped for current item (reset each round)
 
     def add_agent(self, agent: Agent) -> None:
         """Register an agent to participate in the auction."""
@@ -81,10 +83,104 @@ class AuctionEnvironment:
         """Shuffle item order, clear bid history, and reset agent rewards."""
         self.item_order = self.rng.permutation(self.items).tolist()
         self.current_round = 0
+        self.current_bidder_idx = 0
+        self.dropped_this_round = set()
         for item in self.items:
             item.bids.clear()
         for agent in self.agents:
             agent.accumulated_reward = 0.0
+
+    def compute_reward(self, agent: Agent, item: Item, won: bool) -> float:
+        """
+        Compute step reward for an agent and update accumulated reward if they won.
+
+        Args:
+            agent: The agent to compute reward for.
+            item: The item that was auctioned.
+            won: True if this agent won the item.
+
+        Returns:
+            Step reward (agent's valuation if won, else 0). Normalized to [0, 1]
+            for RL stability by dividing by max possible valuation.
+        """
+        if won:
+            r = agent.get_value(item)
+            agent.accumulated_reward += r
+            total_possible = sum(agent.get_value(i) for i in self.items)
+            return r / (total_possible or 1.0)  # Normalized for RL
+        return 0.0
+
+    def get_current_bidder(self) -> Optional[Agent]:
+        """Return the agent whose turn it is to bid, or None if round is over."""
+        if self.is_done():
+            return None
+        return self.agents[self.current_bidder_idx]
+
+    def step(
+        self, agent: Agent, action: Union[float, int]
+    ) -> Tuple[float, bool, Dict[str, Any]]:
+        """
+        Process one agent's action (bid or drop out).
+
+        Args:
+            agent: The agent taking the action.
+            action: Bid amount (float >= 0) or -1 to drop out.
+
+        Returns:
+            (reward, done, info) for the acting agent.
+            reward: Step reward (from compute_reward if agent won; 0 otherwise).
+            done: True if auction is complete.
+            info: Dict with 'winner', 'item', etc.
+        """
+        info: Dict[str, Any] = {}
+        reward = 0.0
+
+        if self.is_done():
+            return 0.0, True, {"msg": "auction already done"}
+
+        agent_idx = self.agents.index(agent)
+        if agent_idx != self.current_bidder_idx:
+            return 0.0, False, {"msg": "not this agent's turn"}
+
+        current_item = self.item_order[self.current_round]
+        dropped = action < 0  # -1 or negative = drop out
+
+        if dropped:
+            self.dropped_this_round.add(agent_idx)
+        else:
+            current_item.bids.append(float(action))
+
+        n = len(self.agents)
+        active = [i for i in range(n) if i not in self.dropped_this_round]
+
+        # Advance to next bidder (round-robin, skip dropped agents)
+        if len(active) > 1:
+            for _ in range(n):
+                self.current_bidder_idx = (self.current_bidder_idx + 1) % n
+                if self.current_bidder_idx not in self.dropped_this_round:
+                    break
+
+        # Check if only one agent remains -> they win; if all dropped -> no winner
+        if len(active) == 1:
+            winner_idx = active[0]
+            winner = self.agents[winner_idx]
+            winner_reward = self.compute_reward(winner, current_item, won=True)
+            if agent == winner:
+                reward = winner_reward
+            info["winner"] = winner
+            info["item"] = current_item
+        elif len(active) == 0:
+            info["winner"] = None
+            info["item"] = current_item
+
+        if len(active) <= 1:
+            # Advance to next round
+            self.current_round += 1
+            self.current_bidder_idx = 0
+            self.dropped_this_round = set()
+
+        done = self.is_done()
+        return reward, done, info
 
     def get_state(self, agent: Agent) -> np.ndarray:
         """
