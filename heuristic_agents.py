@@ -1,8 +1,9 @@
-from typing import Callable, Optional
+from typing import Optional, Protocol
 import random
 
-from incremental_bidder import incremental_bidder
-from threshold_bidder import threshold_bidder
+from dp_bidder import DPBidder
+from incremental_bidder import IncrementalBidder
+from threshold_bidder import ThresholdBidder
 
 STARTING_BUDGET = 25
 PLAYER_INVOLVED = True
@@ -10,24 +11,72 @@ RANDOMIZE_ITEMS = True
 RANDOMIZE_AGENT_ORDER = True
 NUM_ITEMS = 5
 ITEM_VALUES = [50, 80, 20, 30, 10]
-AGENT_SETUPS = [
-    (
-        "aggressive_bidder",
-        threshold_bidder,
-        True,
-        {"threshold_ratio": 1.2, "min_bid": 6, "shrink_rate": 0.7, "stochastic_scale": 10.0},
-    ),
-    (
-        "passive_bidder",
-        threshold_bidder,
-        True,
-        {"threshold_ratio": 0.9, "min_bid": 1, "shrink_rate": 1.0, "stochastic_scale": 6.0},
-    ),
-    ("incremental_bidder", incremental_bidder, True, {"increment": 5}),
-]
+DP_BIDDER1_CONFIG = {
+    "center_frac": 0.60,
+    "scale_frac": 0.18,
+    "payment_factor": 0.60,
+    "bid_step": 1,
+    "enforce_start_price": True,
+}
+DP_BIDDER2_CONFIG = {
+    "center_frac": 0.50,
+    "scale_frac": 0.25,
+    "payment_factor": 0.65,
+    "bid_step": 1,
+    "enforce_start_price": True,
+}
 
 
-HeuristicFn = Callable[..., Optional[int]]
+def build_agent_setups(
+    item_values: list[int],
+    starting_budget: int,
+) -> list[tuple[str, "Bidder"]]:
+    return [
+        (
+            "aggressive_bidder",
+            ThresholdBidder(
+                threshold_ratio=1.2,
+                min_bid=6,
+                shrink_rate=0.7,
+                stochastic_scale=10.0,
+                stochastic=True,
+            ),
+        ),
+        (
+            "passive_bidder",
+            ThresholdBidder(
+                threshold_ratio=0.9,
+                min_bid=1,
+                shrink_rate=1.0,
+                stochastic_scale=6.0,
+                stochastic=True,
+            ),
+        ),
+        #("incremental_bidder", IncrementalBidder(increment=5, stochastic=True)),
+        (
+            "dp_bidder1",
+            DPBidder(item_values=item_values, starting_budget=starting_budget, **DP_BIDDER1_CONFIG),
+        ),
+        (
+            "dp_bidder2",
+            DPBidder(item_values=item_values, starting_budget=starting_budget, **DP_BIDDER2_CONFIG),
+        ),
+    ]
+
+
+class Bidder(Protocol):
+    def bid(
+        self,
+        item_index: int,
+        total_items: int,
+        item_value: int,
+        item_start_price: int,
+        current_price: int,
+        player_budget: int,
+        agent_budget: int,
+        current_winner: str,
+    ) -> Optional[int]:
+        ...
 
 
 def display_name(name: str) -> str:
@@ -68,34 +117,19 @@ def main() -> None:
     if RANDOMIZE_ITEMS:
         ITEM_VALUES = [random.randint(5, 25) for _ in range(NUM_ITEMS)]
     total_items = len(ITEM_VALUES)
-    setups_for_run = AGENT_SETUPS[:]
+    setups_for_run = build_agent_setups(
+        item_values=ITEM_VALUES,
+        starting_budget=STARTING_BUDGET,
+    )
     if RANDOMIZE_AGENT_ORDER:
         random.shuffle(setups_for_run)
 
-    agent_heuristics: dict[str, HeuristicFn] = {}
-    agent_stochastic: dict[str, bool] = {}
-    agent_params: dict[str, dict] = {}
-    for config in setups_for_run:
-        if len(config) == 2:
-            name, heuristic = config
-            stochastic = False
-            params = {}
-        elif len(config) == 3:
-            name, heuristic, third = config
-            if isinstance(third, dict):
-                stochastic = False
-                params = third
-            else:
-                stochastic = third
-                params = {}
-        else:
-            name, heuristic, stochastic, params = config
-        agent_heuristics[name] = heuristic
-        agent_stochastic[name] = stochastic
-        agent_params[name] = params
-    agent_budgets: dict[str, int] = {name: STARTING_BUDGET for name in agent_heuristics}
+    agent_bidders: dict[str, Bidder] = {}
+    for name, bidder in setups_for_run:
+        agent_bidders[name] = bidder
+    agent_budgets: dict[str, int] = {name: STARTING_BUDGET for name in agent_bidders}
     player_won_items: list[int] = []
-    agent_won_items: dict[str, list[int]] = {name: [] for name in agent_heuristics}
+    agent_won_items: dict[str, list[int]] = {name: [] for name in agent_bidders}
 
     print("Auction Begins")
     if PLAYER_INVOLVED:
@@ -198,19 +232,30 @@ def main() -> None:
                 active_bidders.pop(turn_index)
                 continue
 
-            heuristic = agent_heuristics[agent_name]
-            extra_params = agent_params[agent_name]
-            agent_bid = heuristic(
-                item_index=idx - 1,
-                total_items=total_items,
-                item_value=item_value,
-                item_start_price=start_price,
-                current_price=current_price,
-                player_budget=player_budget,
-                agent_budget=agent_budget,
-                stochastic=agent_stochastic[agent_name],
-                **extra_params,
-            )
+            bidder = agent_bidders[agent_name]
+            try:
+                agent_bid = bidder.bid(
+                    item_index=idx - 1,
+                    total_items=total_items,
+                    item_value=item_value,
+                    item_start_price=start_price,
+                    current_price=current_price,
+                    player_budget=player_budget,
+                    agent_budget=agent_budget,
+                    current_winner=current_winner,
+                )
+            except TypeError:
+                # Backward compatibility for bidder instances created before
+                # adding the current_winner argument.
+                agent_bid = bidder.bid(
+                    item_index=idx - 1,
+                    total_items=total_items,
+                    item_value=item_value,
+                    item_start_price=start_price,
+                    current_price=current_price,
+                    player_budget=player_budget,
+                    agent_budget=agent_budget,
+                )
             if agent_bid is None:
                 print(f"{display_name(agent_name)} quits")
                 active_bidders.pop(turn_index)
@@ -241,6 +286,9 @@ def main() -> None:
         elif current_winner in agent_budgets:
             agent_budgets[current_winner] -= current_price
             agent_won_items[current_winner].append(idx)
+            winner_bidder = agent_bidders[current_winner]
+            if hasattr(winner_bidder, "notify_win"):
+                winner_bidder.notify_win(idx - 1)
             print(f"Result: {display_name(current_winner)} wins item {idx} for {current_price}")
         else:
             print(f"Result: item {idx} unsold")
