@@ -14,9 +14,16 @@ from scoring import score_priority_weighted, rank_to_weight
 class Item:
     """Auctionable item with market value and bid history."""
 
-    def __init__(self, name: str, value: int):
+    def __init__(self, name: str, value: int, rank: int = 0):
+        """
+        Args:
+            name: Item identifier.
+            value: Market value (e.g., list price).
+            rank: Priority rank (1 = most wanted). Used by bidders and scoring. 0 = unranked.
+        """
         self.name = name
         self.value = value  # Market value (e.g., list price, estimated worth)
+        self.rank = rank  # Priority rank: 1 = most wanted, matches bidders & scoring.py
         self.bids: List[float] = []  # Bid amounts placed so far for this item
 
 
@@ -143,7 +150,10 @@ class AuctionEnvironment:
         if won:
             n_items = len(self.items)
             max_val = max(agent.valuations.values()) or 1.0
-            item_ranks = {i: agent.get_rank(i) for i in self.items}
+            item_ranks = {
+                i: agent.get_rank(i) or getattr(i, "rank", 0)
+                for i in self.items
+            }
             rank = item_ranks.get(item, 0)
             if agent.budget is not None and agent.budget > 0:
                 if rank > 0:
@@ -274,7 +284,10 @@ class AuctionEnvironment:
         Scalar values are normalized; reward_norm may be negative when using budget-based scoring.
         """
         n_items = len(self.items)
-        item_ranks = {item: agent.get_rank(item) for item in self.items}
+        item_ranks = {
+            item: agent.get_rank(item) or getattr(item, "rank", 0)
+            for item in self.items
+        }
 
         # 1. Which items have been auctioned (done) vs remaining
         items_done = np.zeros(n_items, dtype=np.float32)
