@@ -92,12 +92,21 @@ class AuctionEnvironment:
     Each round auctions one item; agents bid or drop out sequentially.
     """
 
-    def __init__(self, num_agents: int, items: List[Item], rng: Optional[np.random.Generator] = None):
+    def __init__(
+        self,
+        num_agents: int,
+        items: List[Item],
+        rng: Optional[np.random.Generator] = None,
+        use_reward_shaping: bool = False,
+        gamma: float = 0.99,
+    ):
         """
         Args:
             num_agents: Expected number of agents.
             items: All items to be auctioned.
             rng: Random generator for reproducible item order. If None, uses default.
+            use_reward_shaping: If True, add potential-based shaping for denser feedback.
+            gamma: Discount factor for shaping (match RL algorithm). Used when use_reward_shaping.
         """
         self.num_agents = num_agents
         self.items = items
@@ -107,6 +116,29 @@ class AuctionEnvironment:
         self.current_round: int = 0  # Index of item currently being auctioned
         self.current_bidder_idx: int = 0  # Which agent is to act (within current round)
         self.dropped_this_round: set = set()  # Agent indices who dropped for current item (reset each round)
+        self.use_reward_shaping = use_reward_shaping
+        self.gamma = gamma
+
+    def _potential(self, agent: Agent) -> float:
+        """
+        Potential for reward shaping: Φ(s) = remaining_value × budget_ratio.
+        Higher when agent has budget and high-value items left.
+        Returns 0 if agent has no budget (shaping disabled).
+        """
+        if agent.budget is None or agent.budget <= 0:
+            return 0.0
+        n_items = len(self.items)
+        auctioned = set(self.item_order[: self.current_round])
+        remaining_value = 0.0
+        for item in self.items:
+            if item not in auctioned:
+                rank = agent.get_rank(item) or getattr(item, "rank", 0)
+                if rank > 0:
+                    remaining_value += rank_to_weight(
+                        rank, n_items, agent.weight_scheme
+                    )
+        budget_ratio = agent.remaining_budget / agent.budget
+        return remaining_value * budget_ratio
 
     def add_agent(self, agent: Agent) -> None:
         """Register an agent to participate in the auction."""
@@ -214,6 +246,8 @@ class AuctionEnvironment:
         if agent_idx != self.current_bidder_idx:
             return 0.0, False, {"msg": "not this agent's turn"}
 
+        phi_old = self._potential(agent) if self.use_reward_shaping else 0.0
+
         current_item = self.item_order[self.current_round]
         dropped = action < 0  # -1 or negative = drop out
 
@@ -263,6 +297,10 @@ class AuctionEnvironment:
             self.current_round += 1
             self.current_bidder_idx = 0
             self.dropped_this_round = set()
+
+        if self.use_reward_shaping:
+            phi_new = self._potential(agent)
+            reward = reward + self.gamma * phi_new - phi_old
 
         done = self.is_done()
         return reward, done, info
