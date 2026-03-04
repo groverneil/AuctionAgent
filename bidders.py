@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict
 
 from env import Item
+from scoring import rank_to_weight
+
 
 @dataclass
 class BidderState:
@@ -12,6 +14,7 @@ class BidderState:
 
     budget: float
     remaining_budget: float
+    n_items: int = 0
     spent: float = 0.0
     items_won: List[Item] = field(default_factory=list)
     prices_paid: List[float] = field(default_factory=list)
@@ -29,20 +32,39 @@ class BaseBidder(ABC):
         self.bidder_id = bidder_id
         self.budget = budget
 
+    def _priority_value(
+        self,
+        item: Item,
+        state: BidderState,
+        weight_scheme: str = "linear",
+    ) -> float:
+        """
+        Convert an item's priority rank into a dollar-denominated value
+        so existing bid-ceiling math (value / beta, etc.) works unchanged.
+
+        priority_value = w_i * B, where w_i ∈ [0, 1] comes from the rank
+        and B is the starting budget.  Break-even bid = w_i * B / β, which
+        matches the scoring formula score = w_i − β * (p_i / B).
+        """
+        w = rank_to_weight(item.rank, state.n_items, weight_scheme)
+        return w * state.budget
+
     @abstractmethod
     def place_bid(
         self,
         item: Item,
         state: BidderState,
         items_remaining: int,
-        value_mode: str = "linear",
+        weight_scheme: str = "linear",
     ) -> float:
         """Return a non-negative bid for *item* given current *state*."""
         ...
 
-    def new_state(self) -> BidderState:
+    def new_state(self, n_items: int = 0) -> BidderState:
         """Create a fresh BidderState for the start of an episode."""
-        return BidderState(budget=self.budget, remaining_budget=self.budget)
+        return BidderState(
+            budget=self.budget, remaining_budget=self.budget, n_items=n_items,
+        )
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(id={self.bidder_id}, budget={self.budget:.1f})"
@@ -52,7 +74,7 @@ class PositiveMarginBidder(BaseBidder):
     """
     HEURISTIC 1: Positive Margin Bidder
 
-    Bids up to the break-even price p ≤ Q_i / β, then samples
+    Bids up to the break-even price p ≤ (w_i * B) / β, then samples
     a bid uniformly from [min_bid, max_bid].
 
     Parameters
@@ -79,12 +101,12 @@ class PositiveMarginBidder(BaseBidder):
         item: Item,
         state: BidderState,
         items_remaining: int,
-        value_mode: str = "linear",
+        weight_scheme: str = "linear",
     ) -> float:
         if state.remaining_budget <= 0:
             return 0.0
 
-        value = item.get_value(value_mode)
+        value = self._priority_value(item, state, weight_scheme)
         max_bid = value / self.beta
         max_bid = min(max_bid, state.remaining_budget)
 
@@ -99,7 +121,7 @@ class MarginPlusSafetyBidder(BaseBidder):
     HEURISTIC 2: Margin + Safety Buffer Bidder
 
     Only bids when the item clears a minimum profit threshold:
-        Q_i - β * p ≥ m  →  p ≤ (Q_i - m) / β
+        w_i*B - β*p ≥ m  →  p ≤ (w_i*B - m) / β
 
     Bids in the upper half of the affordable range.
 
@@ -126,12 +148,12 @@ class MarginPlusSafetyBidder(BaseBidder):
         item: Item,
         state: BidderState,
         items_remaining: int,
-        value_mode: str = "linear",
+        weight_scheme: str = "linear",
     ) -> float:
         if state.remaining_budget <= 0:
             return 0.0
 
-        value = item.get_value(value_mode)
+        value = self._priority_value(item, state, weight_scheme)
         max_bid = (value - self.margin) / self.beta
         max_bid = min(max_bid, state.remaining_budget)
 
@@ -146,7 +168,7 @@ class BudgetPacedMarginBidder(BaseBidder):
     HEURISTIC 3: Budget-Paced Margin Bidder
 
     Applies two simultaneous bid caps:
-        1. Margin cap  : p ≤ Q_i / β
+        1. Margin cap  : p ≤ (w_i * B) / β
         2. Pace cap    : p ≤ c * (remaining_budget / items_remaining)
 
     For items ranked within the top-K, the pace cap is removed and
@@ -178,12 +200,12 @@ class BudgetPacedMarginBidder(BaseBidder):
         item: Item,
         state: BidderState,
         items_remaining: int,
-        value_mode: str = "linear",
+        weight_scheme: str = "linear",
     ) -> float:
         if state.remaining_budget <= 0 or items_remaining <= 0:
             return 0.0
 
-        value = item.get_value(value_mode)
+        value = self._priority_value(item, state, weight_scheme)
         margin_limit = value / self.beta
         pace_limit = self.c * (state.remaining_budget / items_remaining)
         is_top_k = item.rank <= self.top_k
@@ -205,7 +227,7 @@ class TopKSpecialistBidder(BaseBidder):
     HEURISTIC 4: Top-K Specialist Bidder
 
     Abstains on all items with rank > top_k. On top-K items, bids
-    near the margin ceiling (Q_i - m) / β.
+    near the margin ceiling (w_i*B - m) / β.
 
     Parameters
     ----------
@@ -232,7 +254,7 @@ class TopKSpecialistBidder(BaseBidder):
         item: Item,
         state: BidderState,
         items_remaining: int,
-        value_mode: str = "linear",
+        weight_scheme: str = "linear",
     ) -> float:
         if state.remaining_budget <= 0:
             return 0.0
@@ -240,7 +262,7 @@ class TopKSpecialistBidder(BaseBidder):
         if item.rank > self.top_k:
             return 0.0
 
-        value = item.get_value(value_mode)
+        value = self._priority_value(item, state, weight_scheme)
         max_bid = (value - self.margin) / self.beta
         max_bid = min(max_bid, state.remaining_budget)
 
@@ -254,13 +276,13 @@ class FlatFractionBidder(BaseBidder):
     """
     HEURISTIC 5: Flat Fraction Bidder
 
-    Bids a fixed fraction f of item quality on every item with no
-    adaptation. bid = f * Q_i, capped at remaining budget.
+    Bids a fixed fraction f of priority value on every item with no
+    adaptation. bid = f * w_i * B, capped at remaining budget.
 
     Parameters
     ----------
-    f : bid as a fraction of item quality; f > 1 produces overbids
-        relative to quality, f < 1 produces conservative bids
+    f : bid as a fraction of priority value; f > 1 produces overbids
+        relative to priority, f < 1 produces conservative bids
     """
 
     def __init__(
@@ -277,12 +299,12 @@ class FlatFractionBidder(BaseBidder):
         item: Item,
         state: BidderState,
         items_remaining: int,
-        value_mode: str = "linear",
+        weight_scheme: str = "linear",
     ) -> float:
         if state.remaining_budget <= 0:
             return 0.0
 
-        value = item.get_value(value_mode)
+        value = self._priority_value(item, state, weight_scheme)
         bid = self.f * value
         return min(bid, state.remaining_budget)
 
@@ -295,7 +317,7 @@ class DescendingAggressionBidder(BaseBidder):
     based on how much of the budget has been spent:
 
         aggression = f_start - (f_start - f_end) * (spent / budget)
-        bid = aggression * Q_i / β
+        bid = aggression * (w_i * B) / β
 
     Parameters
     ----------
@@ -322,7 +344,7 @@ class DescendingAggressionBidder(BaseBidder):
         item: Item,
         state: BidderState,
         items_remaining: int,
-        value_mode: str = "linear",
+        weight_scheme: str = "linear",
     ) -> float:
         if state.remaining_budget <= 0:
             return 0.0
@@ -330,7 +352,7 @@ class DescendingAggressionBidder(BaseBidder):
         spend_ratio = state.spent / state.budget if state.budget > 0 else 0.0
         aggression = self.f_start - (self.f_start - self.f_end) * spend_ratio
 
-        value = item.get_value(value_mode)
+        value = self._priority_value(item, state, weight_scheme)
         max_bid = aggression * value / self.beta
         max_bid = min(max_bid, state.remaining_budget)
 
@@ -379,7 +401,7 @@ class SnipeBidder(BaseBidder):
         item: Item,
         state: BidderState,
         items_remaining: int,
-        value_mode: str = "linear",
+        weight_scheme: str = "linear",
     ) -> float:
         if state.remaining_budget <= 0 or items_remaining <= 0:
             return 0.0
@@ -387,7 +409,7 @@ class SnipeBidder(BaseBidder):
         if item.rank < self.snipe_from_rank:
             return 0.0
 
-        value = item.get_value(value_mode)
+        value = self._priority_value(item, state, weight_scheme)
         margin_limit = value / self.beta
         snipe_limit = self.aggression * (state.remaining_budget / items_remaining)
         max_bid = min(margin_limit, snipe_limit, state.remaining_budget)
@@ -403,7 +425,7 @@ class RandomBidder(BaseBidder):
     HEURISTIC 8: Random Bidder
 
     Bids a uniformly random amount between 0 and
-    max_fraction * remaining_budget with no regard for item quality,
+    max_fraction * remaining_budget with no regard for item priority,
     budget state, or episode position.
 
     Parameters
@@ -426,7 +448,7 @@ class RandomBidder(BaseBidder):
         item: Item,
         state: BidderState,
         items_remaining: int,
-        value_mode: str = "linear",
+        weight_scheme: str = "linear",
     ) -> float:
         if state.remaining_budget <= 0:
             return 0.0
