@@ -420,17 +420,12 @@ class AuctionEnvironment:
         """
         Encode the current auction state as a fixed-size vector for the RL agent.
 
-        State vector layout (size = 4*n_items + 5):
+        State vector layout (size = 2*n_items + 3):
         - items_done [n_items]: 1 if item auctioned, 0 otherwise
         - current_item_onehot [n_items]: One-hot encoding of item being auctioned
         - market_value_norm [1]: Current item's market value / max market value
         - current_bid_norm [1]: Highest bid on current item / max market value
         - my_val_current_norm [1]: Agent's weight for current item (normalized)
-        - vals_remaining [n_items]: Agent's weights for remaining items, 0 if done
-        - reward_norm [1]: Accumulated score / total possible (can be negative with heuristic scoring)
-        - progress [1]: current_round / n_items
-
-        Scalar values are normalized; reward_norm may be negative when using budget-based scoring.
         """
         n_items = len(self.items)
         item_ranks = {
@@ -476,36 +471,10 @@ class AuctionEnvironment:
             else:
                 my_val_current_norm = agent.get_value(current_item) / max_val
 
-        # 5. Agent's valuations for remaining items (fixed-size: one per item, 0 if done)
-        # Use rank_to_weight when available for consistency with scoring.py
-        vals_remaining = np.zeros(n_items, dtype=np.float32)
-        for i, item in enumerate(self.items):
-            if items_done[i] == 0:
-                rank = item_ranks.get(item, 0)
-                if rank > 0:
-                    vals_remaining[i] = rank_to_weight(
-                        rank, n_items, agent.weight_scheme
-                    )
-                else:
-                    vals_remaining[i] = agent.get_value(item) / max_val
-
-        # 6. Accumulated reward so far (heuristic score or weight-based)
-        total_possible_weight = sum(
-            rank_to_weight(rk, n_items, agent.weight_scheme)
-            for rk in item_ranks.values()
-            if rk > 0
-        ) or sum(agent.get_value(item) / max_val for item in self.items)
-        reward_norm = agent.accumulated_reward / (total_possible_weight or 1.0)
-
-        # 7. Progress: fraction of rounds completed
-        progress = self.current_round / (n_items or 1)
-
         return np.concatenate([
-            items_done, # completion status of item[i]
-            current_item_onehot, # one-hot encoding of item being auctioned
-            [market_value_norm, current_bid_norm, my_val_current_norm], # size 3 -> market, current bid, agent priority for current item
-            # vals_remaining, # size n_items
-            # [reward_norm, progress], # size 2
+            items_done,
+            current_item_onehot,
+            [market_value_norm, current_bid_norm, my_val_current_norm],
         ])
 
     def is_done(self) -> bool:

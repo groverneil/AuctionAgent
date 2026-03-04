@@ -12,8 +12,8 @@ class AuctionModel(nn.Module):
         x = torch.relu(self.fc1(x))
         x = torch.relu(self.fc2(x))
         x = self.fc3(x)
-        x = torch.softmax(x, dim=1)
         if mask is not None:
-            # mask tells us if it is illegal to bid on this item
-            x = x * mask
+            # Mask before softmax: illegal actions get -inf so they get 0 prob
+            x = x.masked_fill(mask == 0, float("-inf"))
+        x = torch.softmax(x, dim=1)
         return x
