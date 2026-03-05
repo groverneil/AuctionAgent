@@ -8,6 +8,8 @@ Auction ends when all items have been bid on.
 from typing import List, Dict, Any, Optional, Tuple, Union
 import numpy as np
 import torch
+from torch import optim
+from torch.distributions import Categorical
 from model import AuctionModel
 from scoring import score_priority_weighted, rank_to_weight
 from bidders import (
@@ -108,10 +110,28 @@ class Agent:
         self.model = model
 
 class RLAgent(Agent):
-    def __init__(self, name: str, priority: List[Item], valuations: Optional[Dict[str, float]] = None, budget: Optional[float] = None, beta: float = 1.0, weight_scheme: str = "linear"):
+    def __init__(
+        self,
+        name: str,
+        priority: List[Item],
+        valuations: Optional[Dict[str, float]] = None,
+        budget: Optional[float] = None,
+        beta: float = 1.0,
+        weight_scheme: str = "linear",
+        lr: float = 1e-3,
+        gamma: float = 0.99,
+        epsilon_start: float = 1.0,
+        epsilon_end: float = 0.05,
+        epsilon_decay: float = 0.995,
+    ):
         super().__init__(name, priority, valuations, budget, beta, weight_scheme)
         model = AuctionModel(input_size=2*len(priority)+3, hidden_size=128, action_size=2)
         self.bind_model(model, "rl")
+        self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
+        self.gamma = gamma
+        self.epsilon = epsilon_start
+        self.epsilon_end = epsilon_end
+        self.epsilon_decay = epsilon_decay
 
     def get_action(self, state: np.ndarray, mask: Optional[np.ndarray] = None) -> int:
         state_batch = np.asarray(state, dtype=np.float32)
@@ -129,6 +149,67 @@ class RLAgent(Agent):
             )
         action = int(logits.argmax(dim=1).item())
         return action
+
+    def sample_action(
+        self,
+        state: np.ndarray,
+        mask: Optional[np.ndarray] = None,
+        training: bool = True,
+    ) -> Tuple[int, torch.Tensor]:
+        """Sample an action and return (action, log_prob) for policy-gradient training."""
+        state_batch = np.asarray(state, dtype=np.float32)
+        if state_batch.ndim == 1:
+            state_batch = state_batch.reshape(1, -1)
+        mask_t = None
+        mask_np = None
+        if mask is not None:
+            mask_np = np.asarray(mask, dtype=np.float32)
+            if mask_np.ndim == 1:
+                mask_np = mask_np.reshape(1, -1)
+            mask_t = torch.from_numpy(mask_np).float()
+
+        probs = self.model(torch.from_numpy(state_batch), mask_t).squeeze(0)
+        probs = torch.clamp(probs, min=1e-8, max=1.0)
+        probs = probs / probs.sum()
+        dist = Categorical(probs)
+
+        if training and np.random.rand() < self.epsilon:
+            if mask_np is not None:
+                valid_actions = np.where(mask_np[0] > 0)[0]
+                action = int(np.random.choice(valid_actions))
+            else:
+                action = int(np.random.randint(0, probs.shape[0]))
+            action_t = torch.tensor(action, dtype=torch.int64)
+        else:
+            action_t = dist.sample()
+
+        log_prob = dist.log_prob(action_t)
+        return int(action_t.item()), log_prob
+
+    def update_policy(self, rewards: List[float], log_probs: List[torch.Tensor]) -> float:
+        """REINFORCE update over one episode of RL agent transitions."""
+        if not rewards or not log_probs:
+            self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
+            return 0.0
+
+        returns: List[float] = []
+        running = 0.0
+        for reward in reversed(rewards):
+            running = reward + self.gamma * running
+            returns.append(running)
+        returns.reverse()
+
+        returns_t = torch.tensor(returns, dtype=torch.float32)
+        if returns_t.numel() > 1:
+            returns_t = (returns_t - returns_t.mean()) / (returns_t.std(unbiased=False) + 1e-8)
+
+        loss = -(torch.stack(log_probs) * returns_t).sum()
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
+        return float(loss.item())
 
 
 class OpponentAgent(Agent):
@@ -224,6 +305,22 @@ def add_opponents_from_pool(
             bidder=b,
         )
         env.add_agent(agent)
+
+
+def _rl_idx_to_env_action(env: "AuctionEnvironment", agent: RLAgent, action_idx: int) -> float:
+    """
+    Convert RL discrete action to environment action:
+    - 0 => drop out (-1)
+    - 1 => minimum valid bid increment if affordable, else drop
+    """
+    if action_idx == 0:
+        return -1.0
+    current_item = env.item_order[env.current_round]
+    high_bid = max(current_item.bids) if current_item.bids else 0.0
+    min_valid = min_bid_to_beat(high_bid, current_item, env.bid_increment_ratio)
+    if agent.remaining_budget < min_valid:
+        return -1.0
+    return float(round_bid_to_increment(min_valid, current_item, env.bid_increment_ratio))
 
 
 class AuctionEnvironment:
@@ -529,4 +626,87 @@ class AuctionEnvironment:
             else:
                 action = agent.get_action(self.get_state(agent))
             self.step(agent, action)
+
+
+def train_rl_against_heuristics(
+    env: AuctionEnvironment,
+    rl_agent: RLAgent,
+    heuristic_bidders: List[BaseBidder],
+    episodes: int = 1000,
+    seed: Optional[int] = None,
+) -> Dict[str, List[float]]:
+    """
+    Train RL agent against fixed heuristic bidders from bidders.py.
+
+    Assumes all per-step mechanics are already handled by AuctionEnvironment.step.
+    This function only orchestrates episodes and calls RL policy updates.
+    """
+    if seed is not None:
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+
+    if env.num_agents < 1 + len(heuristic_bidders):
+        raise ValueError(
+            f"env.num_agents={env.num_agents} is less than required agents "
+            f"{1 + len(heuristic_bidders)}"
+        )
+
+    env.agents = []
+    env.add_agent(rl_agent)
+    for i, bidder in enumerate(heuristic_bidders, start=1):
+        env.add_agent(
+            OpponentAgent(
+                name=f"Opponent_{i}",
+                priority=env.items,
+                bidder=bidder,
+            )
+        )
+
+    history: Dict[str, List[float]] = {
+        "episode_reward": [],
+        "episode_loss": [],
+        "episode_steps": [],
+    }
+
+    for _ in range(episodes):
+        env.reset()
+        done = False
+        episode_reward = 0.0
+        episode_steps = 0
+        rewards: List[float] = []
+        log_probs: List[torch.Tensor] = []
+
+        while not done:
+            acting_agent = env.get_current_bidder()
+            if acting_agent is None:
+                break
+
+            if acting_agent is rl_agent:
+                state = env.get_state(rl_agent)
+                mask = env.get_mask(rl_agent)
+                raw_action, log_prob = rl_agent.sample_action(
+                    state=state,
+                    mask=mask,
+                    training=True,
+                )
+                action = _rl_idx_to_env_action(env, rl_agent, raw_action)
+                reward, done, _ = env.step(rl_agent, action)
+                rewards.append(reward)
+                log_probs.append(log_prob)
+                episode_reward += reward
+            elif acting_agent.type == "opponent":
+                action = acting_agent.get_action(env=env)
+                _, done, _ = env.step(acting_agent, action)
+            else:
+                action = acting_agent.get_action(env.get_state(acting_agent))
+                _, done, _ = env.step(acting_agent, action)
+            episode_steps += 1
+
+        loss = rl_agent.update_policy(rewards=rewards, log_probs=log_probs)
+
+        history["episode_reward"].append(float(episode_reward))
+        history["episode_loss"].append(float(loss))
+        history["episode_steps"].append(episode_steps)
+
+    return history
 
