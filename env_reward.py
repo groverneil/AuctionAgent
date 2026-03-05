@@ -600,32 +600,128 @@ class AuctionEnvironment:
         return mask
 
     def run_auction(self) -> None:
-        """Run the auction until it is complete."""
-        while not self.is_done():
-            agent = self.get_current_bidder()
-            if agent is None:
-                break
-            if agent.type == "rl":
-                state = self.get_state(agent)
-                mask = self.get_mask(agent)
-                raw_action = agent.get_action(state, mask)
-                # RL model outputs 0=drop, 1=bid; step() expects float bid or -1
-                if raw_action == 0:
-                    action = -1.0
-                else:
-                    current_item = self.item_order[self.current_round]
-                    high_bid = max(current_item.bids) if current_item.bids else 0.0
-                    ratio = self.bid_increment_ratio
-                    min_valid = min_bid_to_beat(high_bid, current_item, ratio)
-                    if agent.remaining_budget < min_valid:
-                        action = -1.0  # Can't afford; drop
-                    else:
-                        action = round_bid_to_increment(min_valid, current_item, ratio)
-            elif agent.type == "opponent":
-                action = agent.get_action(env=self)
+        """
+        Play one full auction using current agents without learning updates.
+
+        Use this for pure simulation/evaluation after agents are already set up
+        on the environment (for example, RL in inference mode vs opponents).
+        """
+        _run_loop(
+            env=self,
+            episodes=1,
+            training=False,
+            update_rl=False,
+            reset_each_episode=False,
+        )
+
+
+def _run_episode(
+    env: AuctionEnvironment,
+    training: bool,
+) -> Dict[str, Any]:
+    """
+    Execute one complete auction episode (one pass until env.is_done()).
+
+    Responsibilities:
+    - Select and execute actions turn-by-turn for whichever agent is active.
+    - Collect RL transitions (rewards + log_probs) when `training=True`.
+    - Return per-episode metrics needed by outer loops.
+
+    Note:
+    - This function does not reset the environment and does not update model
+      weights. Resetting and policy updates are handled in `_run_loop`.
+    """
+    done = False
+    episode_reward = 0.0
+    episode_steps = 0
+    rewards: List[float] = []
+    log_probs: List[torch.Tensor] = []
+
+    while not done:
+        acting_agent = env.get_current_bidder()
+        if acting_agent is None:
+            break
+
+        if acting_agent.type == "rl":
+            state = env.get_state(acting_agent)
+            mask = env.get_mask(acting_agent)
+            if training and isinstance(acting_agent, RLAgent):
+                raw_action, log_prob = acting_agent.sample_action(
+                    state=state,
+                    mask=mask,
+                    training=True,
+                )
+                action = _rl_idx_to_env_action(env, acting_agent, raw_action)
+                reward, done, _ = env.step(acting_agent, action)
+                rewards.append(reward)
+                log_probs.append(log_prob)
+                episode_reward += reward
             else:
-                action = agent.get_action(self.get_state(agent))
-            self.step(agent, action)
+                raw_action = acting_agent.get_action(state, mask)
+                action = _rl_idx_to_env_action(env, acting_agent, raw_action)
+                reward, done, _ = env.step(acting_agent, action)
+                episode_reward += reward
+        elif acting_agent.type == "opponent":
+            action = acting_agent.get_action(env=env)
+            _, done, _ = env.step(acting_agent, action)
+        else:
+            action = acting_agent.get_action(env.get_state(acting_agent))
+            _, done, _ = env.step(acting_agent, action)
+        episode_steps += 1
+
+    return {
+        "episode_reward": float(episode_reward),
+        "episode_steps": episode_steps,
+        "rewards": rewards,
+        "log_probs": log_probs,
+    }
+
+
+def _run_loop(
+    env: AuctionEnvironment,
+    episodes: int,
+    training: bool,
+    update_rl: bool,
+    reset_each_episode: bool = True,
+) -> Dict[str, List[float]]:
+    """
+    Canonical multi-episode loop shared by training and non-training runs.
+
+    Responsibilities:
+    - Optionally reset env at the start of each episode.
+    - Call `_run_episode` to play the auction.
+    - Optionally run RL policy updates after each episode (`update_rl=True`).
+    - Aggregate history (`episode_reward`, `episode_loss`, `episode_steps`).
+    """
+    history: Dict[str, List[float]] = {
+        "episode_reward": [],
+        "episode_loss": [],
+        "episode_steps": [],
+    }
+
+    for _ in range(episodes):
+        if reset_each_episode:
+            env.reset()
+
+        rollout = _run_episode(env=env, training=training)
+        loss = 0.0
+        if update_rl:
+            rl_agents = [a for a in env.agents if isinstance(a, RLAgent)]
+            if len(rl_agents) != 1:
+                raise ValueError(
+                    f"Expected exactly one RLAgent for updates, found {len(rl_agents)}"
+                )
+            rl_agent = rl_agents[0]
+            loss = rl_agent.update_policy(
+                rewards=rollout["rewards"],
+                log_probs=rollout["log_probs"],
+            )
+
+        history["episode_reward"].append(rollout["episode_reward"])
+        history["episode_loss"].append(float(loss))
+        history["episode_steps"].append(rollout["episode_steps"])
+
+    return history
 
 
 def train_rl_against_heuristics(
@@ -636,10 +732,17 @@ def train_rl_against_heuristics(
     seed: Optional[int] = None,
 ) -> Dict[str, List[float]]:
     """
-    Train RL agent against fixed heuristic bidders from bidders.py.
+    Train one RL agent against heuristic bidders from `bidders.py`.
 
-    Assumes all per-step mechanics are already handled by AuctionEnvironment.step.
-    This function only orchestrates episodes and calls RL policy updates.
+    What this function does:
+    - Clears/rebuilds `env.agents` so slot 0 is `rl_agent` and the rest are
+      `OpponentAgent` wrappers around `heuristic_bidders`.
+    - Runs many episodes through `_run_loop(..., training=True, update_rl=True)`.
+    - Returns training history for monitoring reward/loss/episode length.
+
+    What it does *not* do:
+    - It does not implement bidding rules itself; that is still handled by
+      `AuctionEnvironment.step` and agent `get_action` methods.
     """
     if seed is not None:
         np.random.seed(seed)
@@ -662,51 +765,11 @@ def train_rl_against_heuristics(
             )
         )
 
-    history: Dict[str, List[float]] = {
-        "episode_reward": [],
-        "episode_loss": [],
-        "episode_steps": [],
-    }
-
-    for _ in range(episodes):
-        env.reset()
-        done = False
-        episode_reward = 0.0
-        episode_steps = 0
-        rewards: List[float] = []
-        log_probs: List[torch.Tensor] = []
-
-        while not done:
-            acting_agent = env.get_current_bidder()
-            if acting_agent is None:
-                break
-
-            if acting_agent is rl_agent:
-                state = env.get_state(rl_agent)
-                mask = env.get_mask(rl_agent)
-                raw_action, log_prob = rl_agent.sample_action(
-                    state=state,
-                    mask=mask,
-                    training=True,
-                )
-                action = _rl_idx_to_env_action(env, rl_agent, raw_action)
-                reward, done, _ = env.step(rl_agent, action)
-                rewards.append(reward)
-                log_probs.append(log_prob)
-                episode_reward += reward
-            elif acting_agent.type == "opponent":
-                action = acting_agent.get_action(env=env)
-                _, done, _ = env.step(acting_agent, action)
-            else:
-                action = acting_agent.get_action(env.get_state(acting_agent))
-                _, done, _ = env.step(acting_agent, action)
-            episode_steps += 1
-
-        loss = rl_agent.update_policy(rewards=rewards, log_probs=log_probs)
-
-        history["episode_reward"].append(float(episode_reward))
-        history["episode_loss"].append(float(loss))
-        history["episode_steps"].append(episode_steps)
-
-    return history
+    return _run_loop(
+        env=env,
+        episodes=episodes,
+        training=True,
+        update_rl=True,
+        reset_each_episode=True,
+    )
 
