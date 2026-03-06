@@ -10,6 +10,7 @@ def rank_to_weight(
     rank: int,
     n_items: int,
     scheme: str = "linear",
+    seed: int = 0,
 ) -> float:
     """
     Convert a 1-based priority rank into a weight in [0, 1].
