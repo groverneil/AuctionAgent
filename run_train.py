@@ -24,6 +24,7 @@ BID_INCREMENT_RATIO = 0.1
 BETA = 0.5
 WEIGHT_SCHEME = "linear"
 TRAIN_EPISODES = 1000
+N_EVAL = 100  # Number of evaluation auctions to run
 SEED = 42
 
 # ---- Create items with ranks (1 = most wanted) ----
@@ -93,14 +94,43 @@ if winners:
     for name in sorted(win_counts.keys(), key=lambda n: (0 if n == "RL_Agent" else 1, n)):
         print(f"  {name}: {win_counts[name]} / {n_ep} wins")
 
-# ---- Evaluation run ----
+# ---- Evaluation: N_EVAL auctions ----
 print(f"\n{'='*60}")
-print(f"{'EVALUATION AUCTION':^60}")
+print(f"{'EVALUATION':^60}")
 print(f"{'='*60}")
-env.reset()
-print(f"\n  Items in auction order: {[i.name for i in env.item_order]}")
-env.run_auction(save_json=True, json_path="auction_log.json")
+print(f"  Running {N_EVAL} eval auctions...")
 
+# Collect wins per agent per run: {agent_name: [wins_run1, wins_run2, ...]}
+wins_per_agent = {}
+
+for i in range(N_EVAL):
+    env.reset()
+    env.run_auction(save_json=(i == 0), json_path="auction_log.json")  # Save log only for first run
+    for agent in env.agents:
+        name = agent.name
+        if name not in wins_per_agent:
+            wins_per_agent[name] = []
+        wins_per_agent[name].append(len(agent.items_won))
+
+n_rounds = len(env.items)
+agent_heuristic = {a.name: a.bidder.__class__.__name__ for a in env.agents if hasattr(a, "bidder") and a.bidder is not None}
+
+print(f"\n  Eval summary ({N_EVAL} auctions, {n_rounds} rounds each):")
+rankings = sorted(
+    wins_per_agent.keys(),
+    key=lambda n: (-np.mean(wins_per_agent[n]), n),  # sort by mean wins desc, then name
+)
+for rank, name in enumerate(rankings, 1):
+    wins = wins_per_agent[name]
+    mean_w = np.mean(wins)
+    std_w = np.std(wins)
+    pct = 100 * mean_w / n_rounds
+    suffix = f" ({agent_heuristic[name]})" if name in agent_heuristic else ""
+    print(f"    {rank}. {name}{suffix}: {mean_w:.1f} ± {std_w:.1f} rounds/auction ({pct:.1f}%)")
+
+# Detailed output from last run (rl_agent state is from final iteration)
+print(f"\n  Sample run (last auction):")
+print(f"    Items in auction order: {[i.name for i in env.item_order]}")
 print(f"\n  RL Agent:")
 print(f"    Items won:   {len(rl_agent.items_won)}")
 print(f"    Items:       {[i.name for i in rl_agent.items_won]}")

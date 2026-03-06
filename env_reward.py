@@ -20,6 +20,7 @@ from bidders import (
 )
 
 RL_BID_FRACTIONS = (0.0, 0.25, 0.5, 0.75, 1.0)
+BID_SHAPING_REWARD = 0.02  # Small reward for bidding on valued items (encourages participation)
 
 class Item:
     """Auctionable item with market value and bid history."""
@@ -473,6 +474,7 @@ class AuctionEnvironment:
         if logging_enabled:
             info["events"] = []
         dropped = action < 0  # -1 or negative = drop out
+        bid_successful = False
 
         if dropped:
             self.dropped_this_round.add(agent_idx)
@@ -504,6 +506,7 @@ class AuctionEnvironment:
                     )
             else:
                 current_item.bids.append(bid_amount)
+                bid_successful = True
                 if logging_enabled:
                     info["events"].append(
                         {
@@ -563,6 +566,14 @@ class AuctionEnvironment:
             self.current_round += 1
             self.current_bidder_idx = 0
             self.dropped_this_round = set()
+
+        # Reward shaping: small positive reward for bidding on valued items
+        if bid_successful and agent.type == "rl":
+            rank = agent.get_rank(current_item) or getattr(current_item, "rank", 0)
+            if rank > 0:
+                n_items = len(self.items)
+                w = rank_to_weight(rank, n_items, agent.weight_scheme)
+                reward += BID_SHAPING_REWARD * w
 
         done = self.is_done()
         return reward, done, info

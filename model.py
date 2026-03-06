@@ -7,6 +7,9 @@ class AuctionModel(nn.Module):
         self.fc1 = nn.Linear(input_size, hidden_size)
         self.fc2 = nn.Linear(hidden_size, hidden_size)
         self.fc3 = nn.Linear(hidden_size, action_size)
+        # Bias against action 0 (drop): encourages bidding so RL agent wins more
+        with torch.no_grad():
+            self.fc3.bias[0] = -2.0
 
     def forward(self, x, mask=None):
         x = torch.relu(self.fc1(x))
