@@ -6,7 +6,6 @@ Usage:
     python run_train.py
 """
 import numpy as np
-from collections import Counter
 from typing import Dict, List
 from tqdm import tqdm
 from env_reward import (
@@ -95,14 +94,10 @@ print(f"  First {window} avg:    {np.mean(rewards[:window]):.4f}")
 print(f"  Last {window} avg:     {np.mean(rewards[-window:]):.4f}")
 print(f"  Overall avg:      {np.mean(rewards):.4f}")
 print(f"  Best episode:     {max(rewards):.4f}")
-winners = history.get("winner_per_episode", [])
-if winners:
-    n_ep = len(winners)
-    win_counts = Counter(winners)
-    all_names = [a.name for a in env.agents]
-    for name in sorted(all_names, key=lambda n: (0 if n == "RL_Agent" else 1, n)):
-        count = win_counts.get(name, 0)
-        print(f"  {name}: {count} / {n_ep} wins")
+losses = history.get("episode_loss", [])
+if losses:
+    loss_last50 = np.mean(losses[-window:]) if len(losses) >= window else np.mean(losses)
+    print(f"  Loss (last {window}):  {loss_last50:.4f}")
 
 # ---- Evaluation: N_EVAL auctions per seed (multi-seed for variance) ----
 print(f"\n{'='*60}")
