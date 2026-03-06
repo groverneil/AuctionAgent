@@ -6,6 +6,7 @@ a bid or drops out. Agents accumulate reward (weight/priority) for items won.
 Auction ends when all items have been bid on.
 """
 from typing import List, Dict, Any, Optional, Tuple, Union
+import json
 import numpy as np
 import torch
 from torch import optim
@@ -346,6 +347,8 @@ class AuctionEnvironment:
         self.current_bidder_idx: int = 0  # Which agent is to act (within current round)
         self.dropped_this_round: set = set()  # Agent indices who dropped for current item (reset each round)
         self.bid_increment_ratio = bid_increment_ratio
+        self._save_json: bool = False
+        self._json_path: str = "auction_log.json"
 
     def add_agent(self, agent: Agent) -> None:
         """Register an agent to participate in the auction."""
@@ -456,10 +459,22 @@ class AuctionEnvironment:
             return 0.0, False, {"msg": "not this agent's turn"}
 
         current_item = self.item_order[self.current_round]
+        logging_enabled = self._save_json
+        if logging_enabled:
+            info["events"] = []
         dropped = action < 0  # -1 or negative = drop out
 
         if dropped:
             self.dropped_this_round.add(agent_idx)
+            if logging_enabled:
+                info["events"].append(
+                    {
+                        "type": "dropout",
+                        "agent": agent.name,
+                        "round": self.current_round + 1,
+                        "item": current_item.name,
+                    }
+                )
         else:
             ratio = self.bid_increment_ratio
             bid_amount = round_bid_to_increment(float(action), current_item, ratio)
@@ -468,8 +483,27 @@ class AuctionEnvironment:
             # Reject if below min, exceeds budget, or below one increment
             if bid_amount < min_valid or (agent.budget is not None and bid_amount > agent.remaining_budget):
                 self.dropped_this_round.add(agent_idx)
+                if logging_enabled:
+                    info["events"].append(
+                        {
+                            "type": "dropout",
+                            "agent": agent.name,
+                            "round": self.current_round + 1,
+                            "item": current_item.name,
+                        }
+                    )
             else:
                 current_item.bids.append(bid_amount)
+                if logging_enabled:
+                    info["events"].append(
+                        {
+                            "type": "bid",
+                            "agent": agent.name,
+                            "amount": float(round(bid_amount, 2)),
+                            "round": self.current_round + 1,
+                            "item": current_item.name,
+                        }
+                    )
 
         n = len(self.agents)
         active = [i for i in range(n) if i not in self.dropped_this_round]
@@ -500,6 +534,16 @@ class AuctionEnvironment:
             info["winner"] = winner
             info["item"] = current_item
             info["price_paid"] = price_paid
+            if logging_enabled:
+                info["events"].append(
+                    {
+                        "type": "win",
+                        "agent": winner.name,
+                        "item": current_item.name,
+                        "price": float(round(price_paid, 2)),
+                        "round": self.current_round + 1,
+                    }
+                )
         elif len(active) == 0:
             info["winner"] = None
             info["item"] = current_item
@@ -599,20 +643,61 @@ class AuctionEnvironment:
                 mask[0, 1] = 0.0  # Can't afford to outbid (e.g. $100 vs $500 high)
         return mask
 
-    def run_auction(self) -> None:
+    def run_auction(
+        self,
+        save_json: bool = False,
+        json_path: str = "auction_log.json",
+    ) -> None:
         """
         Play one full auction using current agents without learning updates.
 
         Use this for pure simulation/evaluation after agents are already set up
         on the environment (for example, RL in inference mode vs opponents).
+
+        Visualization workflow (run -> log -> replay UI):
+        - env.run_auction()  # Run only, no visualization log output
+        - env.run_auction(save_json=True, json_path="auction_log.json")
+          # Generates the JSON event log used by the visualizer
+        - python visualize.py auction_log.json
+          # Replays that log in the terminal visualization UI
         """
-        _run_loop(
-            env=self,
-            episodes=1,
-            training=False,
-            update_rl=False,
-            reset_each_episode=False,
-        )
+        prev_save_json = self._save_json
+        prev_json_path = self._json_path
+        self._save_json = save_json
+        self._json_path = json_path
+        start_budgets = {
+            agent.name: (
+                float(agent.remaining_budget)
+                if agent.budget is not None
+                else None
+            )
+            for agent in self.agents
+        }
+        try:
+            history, event_log = _run_loop(
+                env=self,
+                episodes=1,
+                training=False,
+                update_rl=False,
+                reset_each_episode=False,
+            )
+            _ = history
+            if self._save_json:
+                payload = {
+                    "metadata": {
+                        "num_agents": self.num_agents,
+                        "bid_increment_ratio": self.bid_increment_ratio,
+                        "item_order": [item.name for item in self.item_order],
+                        "agents": [agent.name for agent in self.agents],
+                        "budgets": start_budgets,
+                    },
+                    "events": event_log,
+                }
+                with open(self._json_path, "w", encoding="utf-8") as fp:
+                    json.dump(payload, fp, indent=2)
+        finally:
+            self._save_json = prev_save_json
+            self._json_path = prev_json_path
 
 
 def _run_episode(
@@ -636,6 +721,7 @@ def _run_episode(
     episode_steps = 0
     rewards: List[float] = []
     log_probs: List[torch.Tensor] = []
+    episode_events: List[Dict[str, Any]] = []
 
     while not done:
         acting_agent = env.get_current_bidder()
@@ -652,21 +738,23 @@ def _run_episode(
                     training=True,
                 )
                 action = _rl_idx_to_env_action(env, acting_agent, raw_action)
-                reward, done, _ = env.step(acting_agent, action)
+                reward, done, info = env.step(acting_agent, action)
                 rewards.append(reward)
                 log_probs.append(log_prob)
                 episode_reward += reward
             else:
                 raw_action = acting_agent.get_action(state, mask)
                 action = _rl_idx_to_env_action(env, acting_agent, raw_action)
-                reward, done, _ = env.step(acting_agent, action)
+                reward, done, info = env.step(acting_agent, action)
                 episode_reward += reward
         elif acting_agent.type == "opponent":
             action = acting_agent.get_action(env=env)
-            _, done, _ = env.step(acting_agent, action)
+            _, done, info = env.step(acting_agent, action)
         else:
             action = acting_agent.get_action(env.get_state(acting_agent))
-            _, done, _ = env.step(acting_agent, action)
+            _, done, info = env.step(acting_agent, action)
+        if env._save_json:
+            episode_events.extend(info.get("events", []))
         episode_steps += 1
 
     return {
@@ -674,6 +762,7 @@ def _run_episode(
         "episode_steps": episode_steps,
         "rewards": rewards,
         "log_probs": log_probs,
+        "events": episode_events,
     }
 
 
@@ -683,7 +772,7 @@ def _run_loop(
     training: bool,
     update_rl: bool,
     reset_each_episode: bool = True,
-) -> Dict[str, List[float]]:
+) -> Tuple[Dict[str, List[float]], List[Dict[str, Any]]]:
     """
     Canonical multi-episode loop shared by training and non-training runs.
 
@@ -698,6 +787,7 @@ def _run_loop(
         "episode_loss": [],
         "episode_steps": [],
     }
+    all_events: List[Dict[str, Any]] = []
 
     for _ in range(episodes):
         if reset_each_episode:
@@ -720,8 +810,10 @@ def _run_loop(
         history["episode_reward"].append(rollout["episode_reward"])
         history["episode_loss"].append(float(loss))
         history["episode_steps"].append(rollout["episode_steps"])
+        if env._save_json:
+            all_events.extend(rollout.get("events", []))
 
-    return history
+    return history, all_events
 
 
 def train_rl_against_heuristics(
@@ -765,11 +857,11 @@ def train_rl_against_heuristics(
             )
         )
 
-    return _run_loop(
+    history, _ = _run_loop(
         env=env,
         episodes=episodes,
         training=True,
         update_rl=True,
         reset_each_episode=True,
     )
-
+    return history
