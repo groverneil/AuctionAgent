@@ -98,6 +98,15 @@ losses = history.get("episode_loss", [])
 if losses:
     loss_last50 = np.mean(losses[-window:]) if len(losses) >= window else np.mean(losses)
     print(f"  Loss (last {window}):  {loss_last50:.4f}")
+# Prefer rounds at best checkpoint (when checkpointing); else last 50 of full run
+best_rounds = history.get("best_train_rounds_last50")
+if best_rounds is not None:
+    print(f"  Rounds at best checkpoint (last 50): {best_rounds:.1f}  # eval-like")
+else:
+    rl_rounds = history.get("episode_rl_rounds", [])
+    if rl_rounds:
+        rounds_last50 = np.mean(rl_rounds[-window:]) if len(rl_rounds) >= window else np.mean(rl_rounds)
+        print(f"  Rounds (last {window}): {rounds_last50:.1f}  # eval-like")
 
 # ---- Evaluation: N_EVAL auctions per seed (multi-seed for variance) ----
 print(f"\n{'='*60}")

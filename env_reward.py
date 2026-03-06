@@ -885,6 +885,7 @@ def _run_loop(
         "episode_reward": [],
         "episode_loss": [],
         "episode_steps": [],
+        "episode_rl_rounds": [],  # Rounds won per episode (eval-like metric)
         "winner_per_episode": [],
     }
     all_events: List[Dict[str, Any]] = []
@@ -898,6 +899,7 @@ def _run_loop(
 
         rollout = _run_episode(env=env, training=training)
         loss = 0.0
+        rl_rounds = 0
         if update_rl:
             rl_agents = [a for a in env.agents if isinstance(a, RLAgent)]
             if len(rl_agents) != 1:
@@ -909,6 +911,7 @@ def _run_loop(
                 rewards=rollout["rewards"],
                 log_probs=rollout["log_probs"],
             )
+            rl_rounds = len(rl_agent.items_won)
 
         # Record which agent had highest score this episode
         if env.agents:
@@ -918,6 +921,7 @@ def _run_loop(
         history["episode_reward"].append(rollout["episode_reward"])
         history["episode_loss"].append(float(loss))
         history["episode_steps"].append(rollout["episode_steps"])
+        history["episode_rl_rounds"].append(rl_rounds)
         if env._save_json:
             all_events.extend(rollout.get("events", []))
 
@@ -990,21 +994,26 @@ def train_rl_against_heuristics(
         "episode_reward": [],
         "episode_loss": [],
         "episode_steps": [],
+        "episode_rl_rounds": [],
         "winner_per_episode": [],
     }
     best_mean_wins = -1.0
     best_state: Optional[Dict[str, torch.Tensor]] = None
+    best_train_rounds_last50: Optional[float] = None
 
     for ep in (tqdm(range(episodes), desc="Training", unit="ep") if not _tqdm_disabled() else range(episodes)):
         env.reset()
         rollout = _run_episode(env=env, training=True)
         loss = 0.0
+        rl_rounds = 0
         rl_agents = [a for a in env.agents if isinstance(a, RLAgent)]
         if len(rl_agents) == 1:
-            loss = rl_agents[0].update_policy(
+            rl_agent = rl_agents[0]
+            loss = rl_agent.update_policy(
                 rewards=rollout["rewards"],
                 log_probs=rollout["log_probs"],
             )
+            rl_rounds = len(rl_agent.items_won)
 
         if env.agents:
             winner = max(env.agents, key=lambda a: a.accumulated_reward)
@@ -1012,14 +1021,20 @@ def train_rl_against_heuristics(
         history["episode_reward"].append(rollout["episode_reward"])
         history["episode_loss"].append(float(loss))
         history["episode_steps"].append(rollout["episode_steps"])
+        history["episode_rl_rounds"].append(rl_rounds)
 
         if checkpoint_every > 0 and checkpoint_eval_n > 0 and (ep + 1) % checkpoint_every == 0:
             mean_wins = _quick_eval_rl_wins(env, rl_agent, checkpoint_eval_n)
             if mean_wins > best_mean_wins:
                 best_mean_wins = mean_wins
                 best_state = {k: v.cpu().clone() for k, v in rl_agent.model.state_dict().items()}
+                rrs = history["episode_rl_rounds"]
+                window = min(50, len(rrs))
+                best_train_rounds_last50 = float(np.mean(rrs[-window:])) if rrs else 0.0
 
     if best_state is not None:
         rl_agent.model.load_state_dict(best_state)
+    if best_train_rounds_last50 is not None:
+        history["best_train_rounds_last50"] = best_train_rounds_last50
 
     return history
