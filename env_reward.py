@@ -8,7 +8,11 @@ Auction ends when all items have been bid on.
 from typing import List, Dict, Any, Optional, Tuple, Union
 import json
 import numpy as np
+import os
 from tqdm import tqdm
+
+def _tqdm_disabled():
+    return bool(os.environ.get("BULK_LOG_WORKER"))
 import torch
 from torch import optim
 from torch.distributions import Categorical
@@ -886,7 +890,7 @@ def _run_loop(
     all_events: List[Dict[str, Any]] = []
 
     iterator = range(episodes)
-    if training and episodes > 100:
+    if training and episodes > 100 and not _tqdm_disabled():
         iterator = tqdm(iterator, desc="Training", unit="ep")
     for _ in iterator:
         if reset_each_episode:
@@ -991,7 +995,7 @@ def train_rl_against_heuristics(
     best_mean_wins = -1.0
     best_state: Optional[Dict[str, torch.Tensor]] = None
 
-    for ep in tqdm(range(episodes), desc="Training", unit="ep"):
+    for ep in (tqdm(range(episodes), desc="Training", unit="ep") if not _tqdm_disabled() else range(episodes)):
         env.reset()
         rollout = _run_episode(env=env, training=True)
         loss = 0.0

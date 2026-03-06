@@ -87,6 +87,8 @@ window = 50
 print(f"\n{'='*60}")
 print(f"{'TRAINING RESULTS':^60}")
 print(f"{'='*60}")
+if CHECKPOINT_EVERY > 0:
+    print(f"  (Stats below are from full training run; final model = best checkpoint by eval)")
 print(f"  Total episodes:   {len(rewards)}")
 print(f"  Final epsilon:    {rl_agent.epsilon:.4f}")
 print(f"  First {window} avg:    {np.mean(rewards[:window]):.4f}")
@@ -97,8 +99,10 @@ winners = history.get("winner_per_episode", [])
 if winners:
     n_ep = len(winners)
     win_counts = Counter(winners)
-    for name in sorted(win_counts.keys(), key=lambda n: (0 if n == "RL_Agent" else 1, n)):
-        print(f"  {name}: {win_counts[name]} / {n_ep} wins")
+    all_names = [a.name for a in env.agents]
+    for name in sorted(all_names, key=lambda n: (0 if n == "RL_Agent" else 1, n)):
+        count = win_counts.get(name, 0)
+        print(f"  {name}: {count} / {n_ep} wins")
 
 # ---- Evaluation: N_EVAL auctions per seed (multi-seed for variance) ----
 print(f"\n{'='*60}")
