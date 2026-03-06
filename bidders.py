@@ -2,10 +2,12 @@ from __future__ import annotations
 import random
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, TYPE_CHECKING
 
-from env import Item
 from scoring import rank_to_weight
+
+if TYPE_CHECKING:
+    from env_reward import Item
 
 
 @dataclass

@@ -19,6 +19,8 @@ from bidders import (
     build_opponent_pool,
 )
 
+RL_BID_FRACTIONS = (0.0, 0.25, 0.5, 0.75, 1.0)
+
 class Item:
     """Auctionable item with market value and bid history."""
 
@@ -126,7 +128,11 @@ class RLAgent(Agent):
         epsilon_decay: float = 0.995,
     ):
         super().__init__(name, priority, valuations, budget, beta, weight_scheme)
-        model = AuctionModel(input_size=2*len(priority)+3, hidden_size=128, action_size=2)
+        model = AuctionModel(
+            input_size=2 * len(priority) + 3,
+            hidden_size=128,
+            action_size=1 + len(RL_BID_FRACTIONS),
+        )
         self.bind_model(model, "rl")
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
         self.gamma = gamma
@@ -312,7 +318,7 @@ def _rl_idx_to_env_action(env: "AuctionEnvironment", agent: RLAgent, action_idx:
     """
     Convert RL discrete action to environment action:
     - 0 => drop out (-1)
-    - 1 => minimum valid bid increment if affordable, else drop
+    - 1..N => bid between min_valid and remaining_budget using RL_BID_FRACTIONS
     """
     if action_idx == 0:
         return -1.0
@@ -321,7 +327,11 @@ def _rl_idx_to_env_action(env: "AuctionEnvironment", agent: RLAgent, action_idx:
     min_valid = min_bid_to_beat(high_bid, current_item, env.bid_increment_ratio)
     if agent.remaining_budget < min_valid:
         return -1.0
-    return float(round_bid_to_increment(min_valid, current_item, env.bid_increment_ratio))
+    fraction = RL_BID_FRACTIONS[action_idx - 1]
+    raw_bid = min_valid + fraction * (agent.remaining_budget - min_valid)
+    bid = round_bid_to_increment(raw_bid, current_item, env.bid_increment_ratio)
+    bid = max(min_valid, min(bid, agent.remaining_budget))
+    return float(bid)
 
 
 class AuctionEnvironment:
@@ -624,23 +634,25 @@ class AuctionEnvironment:
 
     def get_mask(self, agent: Agent) -> np.ndarray:
         """
-        Return action mask for the RL agent (shape (1, 2)): [drop_ok, bid_ok].
-        Masks out bid when the agent cannot afford to bid: e.g. $100 remaining
-        but current high bid is $500 — can't outbid, so bid is illegal.
+        Return action mask for the RL agent.
+
+        Shape is (1, 1 + len(RL_BID_FRACTIONS)):
+        [drop_ok, bid_level_1_ok, ..., bid_level_N_ok]
+
+        Masks out all bid levels when the agent cannot afford the minimum valid bid.
         """
-        mask = np.ones((1, 2), dtype=np.float32)
+        mask = np.ones((1, 1 + len(RL_BID_FRACTIONS)), dtype=np.float32)
         if agent.budget is None:
             return mask
         if agent.remaining_budget <= 0:
-            mask[0, 1] = 0.0  # No budget left
+            mask[0, 1:] = 0.0
             return mask
-        # Can't bid if you can't afford to beat the current high bid (one increment)
         if self.current_round < len(self.item_order):
             current_item = self.item_order[self.current_round]
             high_bid = max(current_item.bids) if current_item.bids else 0.0
             min_bid = min_bid_to_beat(high_bid, current_item, self.bid_increment_ratio)
             if agent.remaining_budget < min_bid:
-                mask[0, 1] = 0.0  # Can't afford to outbid (e.g. $100 vs $500 high)
+                mask[0, 1:] = 0.0
         return mask
 
     def run_auction(

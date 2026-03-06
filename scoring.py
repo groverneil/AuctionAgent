@@ -23,6 +23,8 @@ def rank_to_weight(
     """
     if n_items <= 0:
         raise ValueError("n_items must be positive.")
+    if rank <= 0 or rank > n_items:
+        return 0.0
     if scheme == "linear":
         return (n_items - rank + 1) / n_items
     elif scheme == "exponential":
