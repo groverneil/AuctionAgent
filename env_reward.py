@@ -794,10 +794,11 @@ def _run_loop(
     - Optionally run RL policy updates after each episode (`update_rl=True`).
     - Aggregate history (`episode_reward`, `episode_loss`, `episode_steps`).
     """
-    history: Dict[str, List[float]] = {
+    history: Dict[str, Any] = {
         "episode_reward": [],
         "episode_loss": [],
         "episode_steps": [],
+        "winner_per_episode": [],
     }
     all_events: List[Dict[str, Any]] = []
 
@@ -818,6 +819,11 @@ def _run_loop(
                 rewards=rollout["rewards"],
                 log_probs=rollout["log_probs"],
             )
+
+        # Record which agent had highest score this episode
+        if env.agents:
+            winner = max(env.agents, key=lambda a: a.accumulated_reward)
+            history["winner_per_episode"].append(winner.name)
 
         history["episode_reward"].append(rollout["episode_reward"])
         history["episode_loss"].append(float(loss))

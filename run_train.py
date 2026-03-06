@@ -6,6 +6,7 @@ Usage:
     python run_train.py
 """
 import numpy as np
+from collections import Counter
 from env_reward import (
     Item,
     AuctionEnvironment,
@@ -13,16 +14,16 @@ from env_reward import (
     add_opponents_from_pool,
     train_rl_against_heuristics,
 )
-from bidders import TopKSpecialistBidder
+from bidders import build_opponent_pool
 
 # ---- Config ----
 N_ITEMS = 20
-BUDGET = 100.0
-N_OPPONENTS = 1
+BUDGET = 10000
+N_OPPONENTS = 8
 BID_INCREMENT_RATIO = 0.1
-BETA = 0.3
+BETA = 0.5
 WEIGHT_SCHEME = "linear"
-TRAIN_EPISODES = 500
+TRAIN_EPISODES = 1000
 SEED = 42
 
 # ---- Create items with ranks (1 = most wanted) ----
@@ -54,16 +55,12 @@ rl_agent = RLAgent(
     epsilon_decay=0.995,
 )
 
-# ---- Create heuristic opponents (single TopK specialist) ----
-opponent_bidders = [
-    TopKSpecialistBidder(
-        bidder_id=1,
-        budget=BUDGET,
-        beta=BETA,
-        top_k=5,
-        margin=0.0,
-    ),
-]
+# ---- Create heuristic opponents ----
+opponent_bidders = build_opponent_pool(
+    n_opponents=N_OPPONENTS,
+    budget=BUDGET,
+    seed=SEED,
+)
 
 # ---- Train ----
 print(f"Training for {TRAIN_EPISODES} episodes against {N_OPPONENTS} heuristic opponents...")
@@ -89,12 +86,19 @@ print(f"  First {window} avg:    {np.mean(rewards[:window]):.4f}")
 print(f"  Last {window} avg:     {np.mean(rewards[-window:]):.4f}")
 print(f"  Overall avg:      {np.mean(rewards):.4f}")
 print(f"  Best episode:     {max(rewards):.4f}")
+winners = history.get("winner_per_episode", [])
+if winners:
+    n_ep = len(winners)
+    win_counts = Counter(winners)
+    for name in sorted(win_counts.keys(), key=lambda n: (0 if n == "RL_Agent" else 1, n)):
+        print(f"  {name}: {win_counts[name]} / {n_ep} wins")
 
 # ---- Evaluation run ----
 print(f"\n{'='*60}")
 print(f"{'EVALUATION AUCTION':^60}")
 print(f"{'='*60}")
 env.reset()
+print(f"\n  Items in auction order: {[i.name for i in env.item_order]}")
 env.run_auction(save_json=True, json_path="auction_log.json")
 
 print(f"\n  RL Agent:")
