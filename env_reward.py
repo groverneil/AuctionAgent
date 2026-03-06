@@ -8,6 +8,7 @@ Auction ends when all items have been bid on.
 from typing import List, Dict, Any, Optional, Tuple, Union
 import json
 import numpy as np
+from tqdm import tqdm
 import torch
 from torch import optim
 from torch.distributions import Categorical
@@ -21,6 +22,8 @@ from bidders import (
 
 RL_BID_FRACTIONS = (0.0, 0.25, 0.5, 0.75, 1.0)
 BID_SHAPING_REWARD = 0.02  # Small reward for bidding on valued items (encourages participation)
+OVERPAY_GAMMA = 0.25  # Penalty for paying above market value (capped at 10x overpay)
+MAX_OVERPAY_RATIO = 50.0  # Never bid more than this × item market value (allows competition; 3 was too strict)
 
 class Item:
     """Auctionable item with market value and bid history."""
@@ -108,9 +111,9 @@ class Agent:
                 return i + 1
         return 0
 
-    def bind_model(self, model: AuctionModel, modelType: str) -> None:
+    def bind_model(self, model: AuctionModel, model_type: str) -> None:
         """Set the agent's decision model type (rl or llm). Model params stored for future use."""
-        self.type = modelType
+        self.type = model_type
         self.model = model
 
 class RLAgent(Agent):
@@ -122,7 +125,7 @@ class RLAgent(Agent):
         budget: Optional[float] = None,
         beta: float = 1.0,
         weight_scheme: str = "linear",
-        lr: float = 1e-3,
+        lr: float = 3e-4,
         gamma: float = 0.99,
         epsilon_start: float = 1.0,
         epsilon_end: float = 0.05,
@@ -130,7 +133,7 @@ class RLAgent(Agent):
     ):
         super().__init__(name, priority, valuations, budget, beta, weight_scheme)
         model = AuctionModel(
-            input_size=2 * len(priority) + 3,
+            input_size=2 * len(priority) + 6,  # +3 for items_remaining_norm, budget_fraction, rank_norm
             hidden_size=128,
             action_size=1 + len(RL_BID_FRACTIONS),
         )
@@ -140,6 +143,8 @@ class RLAgent(Agent):
         self.epsilon = epsilon_start
         self.epsilon_end = epsilon_end
         self.epsilon_decay = epsilon_decay
+        self._return_baseline = 0.0  # Running mean for variance reduction
+        self._baseline_momentum = 0.99
 
     def get_action(self, state: np.ndarray, mask: Optional[np.ndarray] = None) -> int:
         state_batch = np.asarray(state, dtype=np.float32)
@@ -208,12 +213,19 @@ class RLAgent(Agent):
         returns.reverse()
 
         returns_t = torch.tensor(returns, dtype=torch.float32)
-        if returns_t.numel() > 1:
-            returns_t = (returns_t - returns_t.mean()) / (returns_t.std(unbiased=False) + 1e-8)
+        ep_return = float(returns_t[0].item())  # First return = full episode return
+        self._return_baseline = (
+            self._baseline_momentum * self._return_baseline
+            + (1 - self._baseline_momentum) * ep_return
+        )
+        advantages = returns_t - self._return_baseline
+        if advantages.numel() > 1:
+            advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
 
-        loss = -(torch.stack(log_probs) * returns_t).sum()
+        loss = -(torch.stack(log_probs) * advantages).sum()
         self.optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.optimizer.step()
 
         self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
@@ -319,7 +331,10 @@ def _rl_idx_to_env_action(env: "AuctionEnvironment", agent: RLAgent, action_idx:
     """
     Convert RL discrete action to environment action:
     - 0 => drop out (-1)
-    - 1..N => bid between min_valid and remaining_budget using RL_BID_FRACTIONS
+    - 1..N => bid between min_valid and value-aware ceiling using RL_BID_FRACTIONS
+
+    Value-aware ceiling: cap max bid at margin_limit = (w_i * B) / beta (like SnipeBidder)
+    to prevent overbidding on low-value items.
     """
     if action_idx == 0:
         return -1.0
@@ -329,7 +344,18 @@ def _rl_idx_to_env_action(env: "AuctionEnvironment", agent: RLAgent, action_idx:
     if agent.remaining_budget < min_valid:
         return -1.0
     fraction = RL_BID_FRACTIONS[action_idx - 1]
-    raw_bid = min_valid + fraction * (agent.remaining_budget - min_valid)
+    # Value-aware ceiling: min of (a) preference break-even, (b) market-value cap
+    n_items = len(env.items)
+    rank = agent.get_rank(current_item) or getattr(current_item, "rank", 0)
+    market_val = float(getattr(current_item, "value", 0) or 1)
+    if rank > 0 and agent.budget and agent.budget > 0:
+        w = rank_to_weight(rank, n_items, agent.weight_scheme)
+        margin_limit = (w * agent.budget) / agent.beta
+        market_cap = market_val * MAX_OVERPAY_RATIO
+        max_bid = min(margin_limit, market_cap, agent.remaining_budget)
+    else:
+        max_bid = min(market_val * MAX_OVERPAY_RATIO, agent.remaining_budget)
+    raw_bid = min_valid + fraction * (max_bid - min_valid)
     bid = round_bid_to_increment(raw_bid, current_item, env.bid_increment_ratio)
     bid = max(min_valid, min(bid, agent.remaining_budget))
     return float(bid)
@@ -356,7 +382,7 @@ class AuctionEnvironment:
         self.item_order: List[Item] = []  # Shuffled at reset; order items are presented
         self.current_round: int = 0  # Index of item currently being auctioned
         self.current_bidder_idx: int = 0  # Which agent is to act (within current round)
-        self.dropped_this_round: set = set()  # Agent indices who dropped for current item (reset each round)
+        self.dropped_this_round: set[int] = set()  # Agent indices who dropped for current item (reset each round)
         self.bid_increment_ratio = bid_increment_ratio
         self._save_json: bool = False
         self._json_path: str = "auction_log.json"
@@ -412,6 +438,7 @@ class AuctionEnvironment:
             rank = item_ranks.get(item, 0)
             if agent.budget is not None and agent.budget > 0:
                 if rank > 0:
+                    market_val = float(getattr(item, "value", 0) or 1)
                     r = score_priority_weighted(
                         rank=rank,
                         price=price_paid,
@@ -419,11 +446,16 @@ class AuctionEnvironment:
                         budget=agent.budget,
                         beta=agent.beta,
                         weight_scheme=agent.weight_scheme,
+                        market_value=market_val,
+                        gamma=OVERPAY_GAMMA,
                     )
                 else:
-                    # Item not in priority: fallback to w_i - β*(p/B)
+                    # Item not in priority: fallback to w_i - β*(p/B) - γ*overpay
                     w_i = agent.get_value(item) / max_val
-                    r = w_i - agent.beta * (price_paid / agent.budget)
+                    market_val = float(getattr(item, "value", 0) or 1)
+                    overpay_excess = max(0.0, price_paid / market_val - 1.0)
+                    overpay_excess = min(overpay_excess, 10.0)
+                    r = w_i - agent.beta * (price_paid / agent.budget) - OVERPAY_GAMMA * overpay_excess
             else:
                 w_i = agent.get_value(item) / max_val
                 r = w_i
@@ -542,9 +574,16 @@ class AuctionEnvironment:
             winner_reward = self.compute_reward(
                 winner, current_item, won=True, price_paid=price_paid
             )
+            if winner.type == "rl":
+                rank = winner.get_rank(current_item) or getattr(current_item, "rank", 0)
+                if rank > 0:
+                    n_items = len(self.items)
+                    w = rank_to_weight(rank, n_items, winner.weight_scheme)
+                    winner_reward += BID_SHAPING_REWARD * w
             if agent == winner:
                 reward = winner_reward
             info["winner"] = winner
+            info["winner_reward"] = winner_reward
             info["item"] = current_item
             info["price_paid"] = price_paid
             if logging_enabled:
@@ -567,14 +606,6 @@ class AuctionEnvironment:
             self.current_bidder_idx = 0
             self.dropped_this_round = set()
 
-        # Reward shaping: small positive reward for bidding on valued items
-        if bid_successful and agent.type == "rl":
-            rank = agent.get_rank(current_item) or getattr(current_item, "rank", 0)
-            if rank > 0:
-                n_items = len(self.items)
-                w = rank_to_weight(rank, n_items, agent.weight_scheme)
-                reward += BID_SHAPING_REWARD * w
-
         done = self.is_done()
         return reward, done, info
 
@@ -582,12 +613,15 @@ class AuctionEnvironment:
         """
         Encode the current auction state as a fixed-size vector for the RL agent.
 
-        State vector layout (size = 2*n_items + 3):
+        State vector layout (size = 2*n_items + 6):
         - items_done [n_items]: 1 if item auctioned, 0 otherwise
         - current_item_onehot [n_items]: One-hot encoding of item being auctioned
         - market_value_norm [1]: Current item's market value / max market value
         - current_bid_norm [1]: Highest bid on current item / max market value
         - my_val_current_norm [1]: Agent's weight for current item (normalized)
+        - current_item_rank_norm [1]: rank/n_items (1=best, low=high priority; SnipeBidder skips rank<6)
+        - items_remaining_norm [1]: items_remaining / n_items (for budget pacing like SnipeBidder)
+        - budget_fraction [1]: remaining_budget / budget (1.0 if no budget)
         """
         n_items = len(self.items)
         item_ranks = {
@@ -633,10 +667,27 @@ class AuctionEnvironment:
             else:
                 my_val_current_norm = agent.get_value(current_item) / max_val
 
+        # 5. Current item rank (1=best); SnipeBidder skips rank < 6
+        current_item_rank_norm = 0.0
+        if self.current_round < n_items:
+            current_item = self.item_order[self.current_round]
+            rk = item_ranks.get(current_item, 0)
+            current_item_rank_norm = rk / (n_items or 1.0)
+
+        # 6. Items remaining (SnipeBidder uses this for pacing)
+        items_remaining = n_items - self.current_round
+        items_remaining_norm = items_remaining / (n_items or 1.0)
+
+        # 7. Budget fraction (SnipeBidder uses remaining_budget / items_remaining)
+        budget_fraction = 1.0
+        if agent.budget is not None and agent.budget > 0:
+            budget_fraction = agent.remaining_budget / agent.budget
+
         return np.concatenate([
             items_done,
             current_item_onehot,
-            [market_value_norm, current_bid_norm, my_val_current_norm],
+            [market_value_norm, current_bid_norm, my_val_current_norm, current_item_rank_norm],
+            [items_remaining_norm, budget_fraction],
         ])
 
     def is_done(self) -> bool:
@@ -650,7 +701,9 @@ class AuctionEnvironment:
         Shape is (1, 1 + len(RL_BID_FRACTIONS)):
         [drop_ok, bid_level_1_ok, ..., bid_level_N_ok]
 
-        Masks out all bid levels when the agent cannot afford the minimum valid bid.
+        Masks out all bid levels when:
+        - Agent cannot afford the minimum valid bid, or
+        - Min valid bid exceeds value-aware ceiling (would force overpay).
         """
         mask = np.ones((1, 1 + len(RL_BID_FRACTIONS)), dtype=np.float32)
         if agent.budget is None:
@@ -664,6 +717,19 @@ class AuctionEnvironment:
             min_bid = min_bid_to_beat(high_bid, current_item, self.bid_increment_ratio)
             if agent.remaining_budget < min_bid:
                 mask[0, 1:] = 0.0
+            elif agent.budget and agent.budget > 0:
+                n_items = len(self.items)
+                rank = agent.get_rank(current_item) or getattr(current_item, "rank", 0)
+                market_val = float(getattr(current_item, "value", 0) or 1)
+                market_cap = market_val * MAX_OVERPAY_RATIO
+                if rank > 0:
+                    w = rank_to_weight(rank, n_items, agent.weight_scheme)
+                    margin_limit = (w * agent.budget) / agent.beta
+                    ceiling = min(margin_limit, market_cap)
+                    if min_bid > ceiling:
+                        mask[0, 1:] = 0.0
+                elif min_bid > market_cap:
+                    mask[0, 1:] = 0.0
         return mask
 
     def run_auction(
@@ -773,6 +839,12 @@ def _run_episode(
         elif acting_agent.type == "opponent":
             action = acting_agent.get_action(env=env)
             _, done, info = env.step(acting_agent, action)
+            if training and info.get("winner_reward") is not None:
+                rl_agents = [a for a in env.agents if isinstance(a, RLAgent)]
+                if rl_agents and info.get("winner") == rl_agents[0] and rewards:
+                    wr = info["winner_reward"]
+                    rewards[-1] += wr
+                    episode_reward += wr
         else:
             action = acting_agent.get_action(env.get_state(acting_agent))
             _, done, info = env.step(acting_agent, action)
@@ -813,7 +885,10 @@ def _run_loop(
     }
     all_events: List[Dict[str, Any]] = []
 
-    for _ in range(episodes):
+    iterator = range(episodes)
+    if training and episodes > 100:
+        iterator = tqdm(iterator, desc="Training", unit="ep")
+    for _ in iterator:
         if reset_each_episode:
             env.reset()
 
@@ -845,25 +920,36 @@ def _run_loop(
     return history, all_events
 
 
+def _quick_eval_rl_wins(env: AuctionEnvironment, rl_agent: RLAgent, n_auctions: int) -> float:
+    """Run n_auctions without learning, return mean RL wins per auction."""
+    wins = []
+    for _ in range(n_auctions):
+        env.reset()
+        _run_loop(
+            env=env,
+            episodes=1,
+            training=False,
+            update_rl=False,
+            reset_each_episode=False,
+        )
+        wins.append(len(rl_agent.items_won))
+    return float(np.mean(wins))
+
+
 def train_rl_against_heuristics(
     env: AuctionEnvironment,
     rl_agent: RLAgent,
     heuristic_bidders: List[BaseBidder],
     episodes: int = 1000,
     seed: Optional[int] = None,
+    checkpoint_every: int = 0,
+    checkpoint_eval_n: int = 30,
 ) -> Dict[str, List[float]]:
     """
     Train one RL agent against heuristic bidders from `bidders.py`.
 
-    What this function does:
-    - Clears/rebuilds `env.agents` so slot 0 is `rl_agent` and the rest are
-      `OpponentAgent` wrappers around `heuristic_bidders`.
-    - Runs many episodes through `_run_loop(..., training=True, update_rl=True)`.
-    - Returns training history for monitoring reward/loss/episode length.
-
-    What it does *not* do:
-    - It does not implement bidding rules itself; that is still handled by
-      `AuctionEnvironment.step` and agent `get_action` methods.
+    When checkpoint_every > 0, evaluates every N episodes and keeps the best
+    model by eval performance. Restores best model at end to reduce variance.
     """
     if seed is not None:
         np.random.seed(seed)
@@ -886,11 +972,50 @@ def train_rl_against_heuristics(
             )
         )
 
-    history, _ = _run_loop(
-        env=env,
-        episodes=episodes,
-        training=True,
-        update_rl=True,
-        reset_each_episode=True,
-    )
+    if checkpoint_every <= 0 or checkpoint_eval_n <= 0:
+        history, _ = _run_loop(
+            env=env,
+            episodes=episodes,
+            training=True,
+            update_rl=True,
+            reset_each_episode=True,
+        )
+        return history
+
+    history: Dict[str, Any] = {
+        "episode_reward": [],
+        "episode_loss": [],
+        "episode_steps": [],
+        "winner_per_episode": [],
+    }
+    best_mean_wins = -1.0
+    best_state: Optional[Dict[str, torch.Tensor]] = None
+
+    for ep in tqdm(range(episodes), desc="Training", unit="ep"):
+        env.reset()
+        rollout = _run_episode(env=env, training=True)
+        loss = 0.0
+        rl_agents = [a for a in env.agents if isinstance(a, RLAgent)]
+        if len(rl_agents) == 1:
+            loss = rl_agents[0].update_policy(
+                rewards=rollout["rewards"],
+                log_probs=rollout["log_probs"],
+            )
+
+        if env.agents:
+            winner = max(env.agents, key=lambda a: a.accumulated_reward)
+            history["winner_per_episode"].append(winner.name)
+        history["episode_reward"].append(rollout["episode_reward"])
+        history["episode_loss"].append(float(loss))
+        history["episode_steps"].append(rollout["episode_steps"])
+
+        if checkpoint_every > 0 and checkpoint_eval_n > 0 and (ep + 1) % checkpoint_every == 0:
+            mean_wins = _quick_eval_rl_wins(env, rl_agent, checkpoint_eval_n)
+            if mean_wins > best_mean_wins:
+                best_mean_wins = mean_wins
+                best_state = {k: v.cpu().clone() for k, v in rl_agent.model.state_dict().items()}
+
+    if best_state is not None:
+        rl_agent.model.load_state_dict(best_state)
+
     return history

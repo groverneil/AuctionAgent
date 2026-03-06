@@ -7,11 +7,12 @@ Usage:
 """
 import numpy as np
 from collections import Counter
+from typing import Dict, List
+from tqdm import tqdm
 from env_reward import (
     Item,
     AuctionEnvironment,
     RLAgent,
-    add_opponents_from_pool,
     train_rl_against_heuristics,
 )
 from bidders import build_opponent_pool
@@ -23,9 +24,12 @@ N_OPPONENTS = 8
 BID_INCREMENT_RATIO = 0.1
 BETA = 0.5
 WEIGHT_SCHEME = "linear"
-TRAIN_EPISODES = 1000
+TRAIN_EPISODES = 2500
 N_EVAL = 100  # Number of evaluation auctions to run
-SEED = 42
+CHECKPOINT_EVERY = 100  # Evaluate and save best model every N episodes (0 = off)
+CHECKPOINT_EVAL_N = 50  # Auctions per checkpoint eval (higher = more stable best-model selection)
+SEEDS = [42, 123, 456]  # Multi-seed for variance reduction; first used for training
+SEED = SEEDS[0]
 
 # ---- Create items with ranks (1 = most wanted) ----
 rng = np.random.default_rng(SEED)
@@ -49,7 +53,7 @@ rl_agent = RLAgent(
     budget=BUDGET,
     beta=BETA,
     weight_scheme=WEIGHT_SCHEME,
-    lr=1e-3,
+    lr=3e-4,  # Lower LR for stability (was 1e-3)
     gamma=0.99,
     epsilon_start=1.0,
     epsilon_end=0.05,
@@ -73,6 +77,8 @@ history = train_rl_against_heuristics(
     heuristic_bidders=opponent_bidders,
     episodes=TRAIN_EPISODES,
     seed=SEED,
+    checkpoint_every=CHECKPOINT_EVERY,
+    checkpoint_eval_n=CHECKPOINT_EVAL_N,
 )
 
 # ---- Print training summary ----
@@ -94,34 +100,38 @@ if winners:
     for name in sorted(win_counts.keys(), key=lambda n: (0 if n == "RL_Agent" else 1, n)):
         print(f"  {name}: {win_counts[name]} / {n_ep} wins")
 
-# ---- Evaluation: N_EVAL auctions ----
+# ---- Evaluation: N_EVAL auctions per seed (multi-seed for variance) ----
 print(f"\n{'='*60}")
 print(f"{'EVALUATION':^60}")
 print(f"{'='*60}")
-print(f"  Running {N_EVAL} eval auctions...")
+print(f"  Running {N_EVAL} eval auctions × {len(SEEDS)} seeds...")
 
-# Collect wins per agent per run: {agent_name: [wins_run1, wins_run2, ...]}
-wins_per_agent = {}
+all_wins: Dict[str, List[float]] = {}
 
-for i in range(N_EVAL):
-    env.reset()
-    env.run_auction(save_json=(i == 0), json_path="auction_log.json")  # Save log only for first run
-    for agent in env.agents:
-        name = agent.name
-        if name not in wins_per_agent:
-            wins_per_agent[name] = []
-        wins_per_agent[name].append(len(agent.items_won))
+total_eval = N_EVAL * len(SEEDS)
+with tqdm(total=total_eval, desc="Evaluation", unit="auction") as pbar:
+    for eval_seed in SEEDS:
+        env.rng = np.random.default_rng(eval_seed)
+        for i in range(N_EVAL):
+            env.reset()
+            env.run_auction(save_json=(eval_seed == SEEDS[0] and i == 0), json_path="auction_log.json")
+            for agent in env.agents:
+                name = agent.name
+                if name not in all_wins:
+                    all_wins[name] = []
+                all_wins[name].append(len(agent.items_won))
+            pbar.update(1)
 
 n_rounds = len(env.items)
 agent_heuristic = {a.name: a.bidder.__class__.__name__ for a in env.agents if hasattr(a, "bidder") and a.bidder is not None}
 
-print(f"\n  Eval summary ({N_EVAL} auctions, {n_rounds} rounds each):")
+print(f"\n  Eval summary ({N_EVAL * len(SEEDS)} auctions, {n_rounds} rounds each):")
 rankings = sorted(
-    wins_per_agent.keys(),
-    key=lambda n: (-np.mean(wins_per_agent[n]), n),  # sort by mean wins desc, then name
+    all_wins.keys(),
+    key=lambda n: (-np.mean(all_wins[n]), n),
 )
 for rank, name in enumerate(rankings, 1):
-    wins = wins_per_agent[name]
+    wins = all_wins[name]
     mean_w = np.mean(wins)
     std_w = np.std(wins)
     pct = 100 * mean_w / n_rounds

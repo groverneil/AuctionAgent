@@ -87,28 +87,24 @@ def score_priority_weighted(
     budget: float,
     beta: float = 1.0,
     weight_scheme: str = "linear",
+    market_value: float = 0.0,
+    gamma: float = 0.1,
 ) -> float:
     """
-    score = w_i - β * (p_i / B)
+    score = w_i - β * (p_i / B) - γ * min(max(0, p_i/V_i - 1), 10)
 
-    The value side is the item's priority weight (derived from rank)
-    rather than its market value, so the score directly measures how
-    well the bidder acquired *personally important* items relative to
-    how much budget it spent.
-
-    Parameters
-    ----------
-    rank           : item's priority rank (1 = most wanted)
-    price          : price paid p_i
-    n_items        : total items in the auction (needed for weight calc)
-    budget         : total starting budget B
-    beta           : tradeoff between priority and cost
-    weight_scheme  : how rank maps to weight ("linear" or "exponential")
+    Cost: budget term + overpay penalty (capped at 10x to avoid explosion).
     """
     if budget <= 0:
         raise ValueError("budget must be positive.")
     w = rank_to_weight(rank, n_items, weight_scheme)
-    return w - beta * (price / budget)
+    cost_budget = beta * (price / budget)
+    cost_overpay = 0.0
+    if market_value > 0:
+        overpay_excess = max(0.0, price / market_value - 1.0)
+        overpay_excess = min(overpay_excess, 10.0)
+        cost_overpay = gamma * overpay_excess
+    return w - cost_budget - cost_overpay
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +122,7 @@ def compute_score(
     rank: int = 0,
     n_items: int = 1,
     weight_scheme: str = "linear",
+    gamma: float = 0.25,
 ) -> float:
     """
     Unified entry point for scoring a single win.
@@ -141,6 +138,7 @@ def compute_score(
     rank           : item priority rank, 1 = best   (priority_weighted only)
     n_items        : total items in auction          (priority_weighted only)
     weight_scheme  : "linear" or "exponential"       (priority_weighted only)
+    gamma         : overpay penalty (priority_weighted only; matches env_reward.OVERPAY_GAMMA)
     """
     if mode == "basic":
         return score_basic(value, price, beta)
@@ -149,5 +147,7 @@ def compute_score(
     elif mode == "priority_weighted":
         return score_priority_weighted(
             rank, price, n_items, budget, beta, weight_scheme,
+            market_value=value,
+            gamma=gamma,
         )
     raise ValueError(f"Unknown scoring mode: {mode!r}")
