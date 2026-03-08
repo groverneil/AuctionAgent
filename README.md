@@ -152,6 +152,10 @@ cp .env.example .env
 # Set SAVE_MODEL = False in run_train.py to disable
 python run_train.py
 
+# Evaluate the saved model against an LLM opponent + heuristic bidders
+# Requires a valid API_KEY in .env. Runs 3 auctions and saves auction_log_LLM.json
+python eval_LLM.py
+
 # Bulk runs (10 seeds, parallel)
 python bulk_log.py
 
