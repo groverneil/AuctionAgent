@@ -263,6 +263,33 @@ class OpponentAgent(Agent):
         self.bidder = bidder
         self.type = "opponent"
 
+    def _build_bidder_state(self) -> BidderState:
+        return BidderState(
+            budget=self.budget,
+            remaining_budget=self.remaining_budget,
+            n_items=len(self.priority),
+            spent=sum(self.prices_paid),
+            items_won=list(self.items_won),
+            prices_paid=list(self.prices_paid),
+            total_score=self.accumulated_reward,
+        )
+
+    def _finalize_bid(
+        self,
+        env: "AuctionEnvironment",
+        bid: float,
+    ) -> float:
+        if bid <= 0:
+            return -1.0
+        current_item = env.item_order[env.current_round]
+        ratio = env.bid_increment_ratio
+        bid = round_bid_to_increment(float(bid), current_item, ratio)
+        high_bid = max(current_item.bids) if current_item.bids else 0.0
+        min_valid = min_bid_to_beat(high_bid, current_item, ratio)
+        if bid < min_valid:
+            bid = min_valid
+        return float(bid)
+
     def get_action(
         self,
         env: "AuctionEnvironment",
@@ -273,34 +300,38 @@ class OpponentAgent(Agent):
         Returns bid amount (>= 0) or -1 to drop out. Called by run_auction when
         it is this agent's turn.
         """
+        del state
         if env.is_done():
             return -1.0
         current_item = env.item_order[env.current_round]
         items_remaining = len(env.items) - env.current_round
-        bidder_state = BidderState(
-            budget=self.budget,
-            remaining_budget=self.remaining_budget,
-            n_items=len(env.items),
-            spent=sum(self.prices_paid),
-            items_won=list(self.items_won),
-            prices_paid=list(self.prices_paid),
-            total_score=self.accumulated_reward,
-        )
+        bidder_state = self._build_bidder_state()
         bid = self.bidder.place_bid(
             current_item,
             bidder_state,
             items_remaining=items_remaining,
             weight_scheme=self.weight_scheme,
         )
-        if bid <= 0:
+        return self._finalize_bid(env, bid)
+
+    async def get_action_async(
+        self,
+        env: "AuctionEnvironment",
+        state: Optional[np.ndarray] = None,
+    ) -> float:
+        del state
+        if env.is_done():
             return -1.0
-        ratio = env.bid_increment_ratio
-        bid = round_bid_to_increment(float(bid), current_item, ratio)
-        high_bid = max(current_item.bids) if current_item.bids else 0.0
-        min_valid = min_bid_to_beat(high_bid, current_item, ratio)
-        if bid < min_valid:
-            bid = min_valid
-        return float(bid)
+        current_item = env.item_order[env.current_round]
+        items_remaining = len(env.items) - env.current_round
+        bidder_state = self._build_bidder_state()
+        bid = await self.bidder.place_bid_async(
+            current_item,
+            bidder_state,
+            items_remaining=items_remaining,
+            weight_scheme=self.weight_scheme,
+        )
+        return self._finalize_bid(env, bid)
 
 
 def add_opponents_from_pool(
@@ -390,6 +421,36 @@ class AuctionEnvironment:
         self.bid_increment_ratio = bid_increment_ratio
         self._save_json: bool = False
         self._json_path: str = "auction_log.json"
+
+    def _capture_start_budgets(self) -> Dict[str, Optional[float]]:
+        return {
+            agent.name: (
+                float(agent.remaining_budget)
+                if agent.budget is not None
+                else None
+            )
+            for agent in self.agents
+        }
+
+    def _build_event_payload(
+        self,
+        start_budgets: Dict[str, Optional[float]],
+        event_log: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        return {
+            "metadata": {
+                "num_agents": self.num_agents,
+                "bid_increment_ratio": self.bid_increment_ratio,
+                "item_order": [item.name for item in self.item_order],
+                "agents": [agent.name for agent in self.agents],
+                "budgets": start_budgets,
+            },
+            "events": event_log,
+        }
+
+    def _write_event_payload(self, payload: Dict[str, Any]) -> None:
+        with open(self._json_path, "w", encoding="utf-8") as fp:
+            json.dump(payload, fp, indent=2)
 
     def add_agent(self, agent: Agent) -> None:
         """Register an agent to participate in the auction."""
@@ -740,7 +801,8 @@ class AuctionEnvironment:
         self,
         save_json: bool = False,
         json_path: str = "auction_log.json",
-    ) -> None:
+        return_payload: bool = False,
+    ) -> Optional[Dict[str, Any]]:
         """
         Play one full auction using current agents without learning updates.
 
@@ -756,16 +818,10 @@ class AuctionEnvironment:
         """
         prev_save_json = self._save_json
         prev_json_path = self._json_path
-        self._save_json = save_json
+        capture_payload = save_json or return_payload
+        self._save_json = capture_payload
         self._json_path = json_path
-        start_budgets = {
-            agent.name: (
-                float(agent.remaining_budget)
-                if agent.budget is not None
-                else None
-            )
-            for agent in self.agents
-        }
+        start_budgets = self._capture_start_budgets()
         try:
             history, event_log = _run_loop(
                 env=self,
@@ -775,22 +831,70 @@ class AuctionEnvironment:
                 reset_each_episode=False,
             )
             _ = history
-            if self._save_json:
-                payload = {
-                    "metadata": {
-                        "num_agents": self.num_agents,
-                        "bid_increment_ratio": self.bid_increment_ratio,
-                        "item_order": [item.name for item in self.item_order],
-                        "agents": [agent.name for agent in self.agents],
-                        "budgets": start_budgets,
-                    },
-                    "events": event_log,
-                }
-                with open(self._json_path, "w", encoding="utf-8") as fp:
-                    json.dump(payload, fp, indent=2)
+            payload = None
+            if capture_payload:
+                payload = self._build_event_payload(start_budgets, event_log)
+                if save_json:
+                    self._write_event_payload(payload)
+            return payload
         finally:
             self._save_json = prev_save_json
             self._json_path = prev_json_path
+
+    async def run_auction_async(
+        self,
+        save_json: bool = False,
+        json_path: str = "auction_log.json",
+        return_payload: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Async evaluation-only variant of run_auction."""
+        prev_save_json = self._save_json
+        prev_json_path = self._json_path
+        capture_payload = save_json or return_payload
+        self._save_json = capture_payload
+        self._json_path = json_path
+        start_budgets = self._capture_start_budgets()
+        try:
+            event_log = await _run_episode_async(self)
+            payload = None
+            if capture_payload:
+                payload = self._build_event_payload(start_budgets, event_log)
+                if save_json:
+                    self._write_event_payload(payload)
+            return payload
+        finally:
+            self._save_json = prev_save_json
+            self._json_path = prev_json_path
+
+
+async def _run_episode_async(
+    env: AuctionEnvironment,
+) -> List[Dict[str, Any]]:
+    """Execute one evaluation episode while allowing opponent I/O to overlap."""
+    done = False
+    episode_events: List[Dict[str, Any]] = []
+
+    while not done:
+        acting_agent = env.get_current_bidder()
+        if acting_agent is None:
+            break
+
+        if acting_agent.type == "rl":
+            state = env.get_state(acting_agent)
+            mask = env.get_mask(acting_agent)
+            raw_action = acting_agent.get_action(state, mask)
+            action = _rl_idx_to_env_action(env, acting_agent, raw_action)
+            _, done, info = env.step(acting_agent, action)
+        elif acting_agent.type == "opponent":
+            action = await acting_agent.get_action_async(env=env)
+            _, done, info = env.step(acting_agent, action)
+        else:
+            action = acting_agent.get_action(env.get_state(acting_agent))
+            _, done, info = env.step(acting_agent, action)
+        if env._save_json:
+            episode_events.extend(info.get("events", []))
+
+    return episode_events
 
 
 def _run_episode(

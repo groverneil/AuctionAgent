@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import importlib
 import os
 import random
@@ -36,6 +37,7 @@ class BaseBidder(ABC):
     def __init__(self, bidder_id: int, budget: float):
         self.bidder_id = bidder_id
         self.budget = budget
+        self._rng = random.Random()
 
     def _priority_value(
         self,
@@ -65,11 +67,33 @@ class BaseBidder(ABC):
         """Return a non-negative bid for *item* given current *state*."""
         ...
 
+    async def place_bid_async(
+        self,
+        item: Item,
+        state: BidderState,
+        items_remaining: int,
+        weight_scheme: str = "linear",
+    ) -> float:
+        """Async entrypoint used by concurrent evaluation."""
+        return self.place_bid(
+            item,
+            state,
+            items_remaining=items_remaining,
+            weight_scheme=weight_scheme,
+        )
+
     def new_state(self, n_items: int = 0) -> BidderState:
         """Create a fresh BidderState for the start of an episode."""
         return BidderState(
             budget=self.budget, remaining_budget=self.budget, n_items=n_items,
         )
+
+    def set_seed(self, seed: Optional[int]) -> None:
+        """Seed bidder-local randomness to isolate parallel auctions."""
+        self._rng.seed(seed)
+
+    def _uniform(self, low: float, high: float) -> float:
+        return self._rng.uniform(low, high)
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(id={self.bidder_id}, budget={self.budget:.1f})"
@@ -118,7 +142,7 @@ class PositiveMarginBidder(BaseBidder):
         if max_bid < self.min_bid:
             return 0.0
 
-        return random.uniform(self.min_bid, max_bid)
+        return self._uniform(self.min_bid, max_bid)
 
 
 class MarginPlusSafetyBidder(BaseBidder):
@@ -165,7 +189,7 @@ class MarginPlusSafetyBidder(BaseBidder):
         if max_bid <= 0:
             return 0.0
 
-        return random.uniform(max_bid * 0.5, max_bid)
+        return self._uniform(max_bid * 0.5, max_bid)
 
 
 class BudgetPacedMarginBidder(BaseBidder):
@@ -224,7 +248,7 @@ class BudgetPacedMarginBidder(BaseBidder):
             return 0.0
 
         low = max_bid * (0.7 if is_top_k else 0.4)
-        return random.uniform(low, max_bid)
+        return self._uniform(low, max_bid)
 
 
 class TopKSpecialistBidder(BaseBidder):
@@ -274,7 +298,7 @@ class TopKSpecialistBidder(BaseBidder):
         if max_bid <= 0:
             return 0.0
 
-        return random.uniform(max_bid * 0.75, max_bid)
+        return self._uniform(max_bid * 0.75, max_bid)
 
 
 class FlatFractionBidder(BaseBidder):
@@ -364,7 +388,7 @@ class DescendingAggressionBidder(BaseBidder):
         if max_bid <= 0:
             return 0.0
 
-        noise = random.uniform(0.9, 1.0)
+        noise = self._uniform(0.9, 1.0)
         return max_bid * noise
 
 
@@ -422,7 +446,7 @@ class SnipeBidder(BaseBidder):
         if max_bid <= 0:
             return 0.0
 
-        return random.uniform(max_bid * 0.8, max_bid)
+        return self._uniform(max_bid * 0.8, max_bid)
 
 
 class RandomBidder(BaseBidder):
@@ -459,7 +483,7 @@ class RandomBidder(BaseBidder):
             return 0.0
 
         cap = self.max_fraction * state.remaining_budget
-        return random.uniform(0.0, cap)
+        return self._uniform(0.0, cap)
 
 
 class LLMBidder(BaseBidder):
@@ -487,8 +511,11 @@ class LLMBidder(BaseBidder):
         self.temperature = temperature
         self.debug = debug
         self._client = None
+        self._async_client = None
+        self.call_count = 0
 
-    def _get_client(self):
+    @staticmethod
+    def _load_api_key() -> str:
         try:
             from dotenv import load_dotenv
             load_dotenv()
@@ -497,11 +524,25 @@ class LLMBidder(BaseBidder):
         api_key = os.getenv("API_KEY", "")
         if not api_key:
             raise ValueError("Missing API_KEY environment variable.")
+        return api_key
+
+    def _get_client(self):
+        api_key = self._load_api_key()
         if self._client is None:
             openai_mod = importlib.import_module("openai")
             OpenAI = getattr(openai_mod, "OpenAI")
             self._client = OpenAI(api_key=api_key, base_url=self.BASE_URL)
         return self._client
+
+    def _get_async_client(self):
+        api_key = self._load_api_key()
+        if self._async_client is None:
+            openai_mod = importlib.import_module("openai")
+            AsyncOpenAI = getattr(openai_mod, "AsyncOpenAI", None)
+            if AsyncOpenAI is None:
+                raise AttributeError("AsyncOpenAI is not available in the installed openai package.")
+            self._async_client = AsyncOpenAI(api_key=api_key, base_url=self.BASE_URL)
+        return self._async_client
 
     @staticmethod
     def _extract_first_number(text: str) -> Optional[float]:
@@ -542,39 +583,75 @@ class LLMBidder(BaseBidder):
         lines.extend(["", "Output one numeric bid (0 or >= min_required):"])
         return "\n".join(lines)
 
+    def _request_messages(self, prompt: str):
+        return [
+            {"role": "system", "content": "Output only a numeric bid."},
+            {"role": "user", "content": prompt},
+        ]
+
+    def _parse_response_bid(self, resp) -> Optional[float]:
+        raw = resp.choices[0].message.content if resp.choices else ""
+        return self._extract_first_number(raw or "")
+
+    def _call_llm_once(self, prompt: str) -> Optional[float]:
+        client = self._get_client()
+        resp = client.chat.completions.create(
+            model=self.MODEL,
+            temperature=self.temperature,
+            messages=self._request_messages(prompt),
+        )
+        return self._parse_response_bid(resp)
+
     def _call_llm(self, prompt: str) -> Optional[float]:
+        self.call_count += 1
         try:
-            client = self._get_client()
-            resp = client.chat.completions.create(
-                model=self.MODEL,
-                temperature=self.temperature,
-                messages=[
-                    {"role": "system", "content": "Output only a numeric bid."},
-                    {"role": "user", "content": prompt},
-                ],
-            )
-            raw = resp.choices[0].message.content if resp.choices else ""
-            return self._extract_first_number(raw or "")
+            return self._call_llm_once(prompt)
         except Exception as exc:
             if self.debug:
                 print(f"[LLMBidder {self.bidder_id}] API error: {exc!r}")
             return None
 
-    def place_bid(
+    async def _call_llm_async(self, prompt: str) -> Optional[float]:
+        self.call_count += 1
+        try:
+            client = self._get_async_client()
+            resp = await client.chat.completions.create(
+                model=self.MODEL,
+                temperature=self.temperature,
+                messages=self._request_messages(prompt),
+            )
+            return self._parse_response_bid(resp)
+        except (ImportError, AttributeError, ModuleNotFoundError):
+            try:
+                return await asyncio.to_thread(self._call_llm_once, prompt)
+            except Exception as exc:
+                if self.debug:
+                    print(f"[LLMBidder {self.bidder_id}] API error: {exc!r}")
+                return None
+        except Exception as exc:
+            if self.debug:
+                print(f"[LLMBidder {self.bidder_id}] API error: {exc!r}")
+            return None
+
+    def _build_bid_request(
         self,
         item: "Item",
         state: BidderState,
         items_remaining: int,
-        weight_scheme: str = "linear",
-    ) -> float:
-        if state.remaining_budget <= 0:
-            return 0.0
+    ) -> tuple[str, float]:
         bid_history = [float(x) for x in item.bids]
         high_bid = max(bid_history) if bid_history else 0.0
         inc = self.BID_INCREMENT_RATIO * float(item.value)
         min_required = high_bid + inc
         prompt = self._build_prompt(item, state, items_remaining, high_bid, min_required)
-        bid = self._call_llm(prompt)
+        return prompt, min_required
+
+    def _normalize_bid(
+        self,
+        bid: Optional[float],
+        state: BidderState,
+        min_required: float,
+    ) -> float:
         if bid is None:
             if self.debug:
                 print(f"[LLMBidder {self.bidder_id}] Could not parse bid, dropping.")
@@ -586,6 +663,33 @@ class LLMBidder(BaseBidder):
         if bid > state.remaining_budget:
             bid = state.remaining_budget
         return float(bid)
+
+    def place_bid(
+        self,
+        item: "Item",
+        state: BidderState,
+        items_remaining: int,
+        weight_scheme: str = "linear",
+    ) -> float:
+        if state.remaining_budget <= 0:
+            return 0.0
+        prompt, min_required = self._build_bid_request(item, state, items_remaining)
+        bid = self._call_llm(prompt)
+        return self._normalize_bid(bid, state, min_required)
+
+    async def place_bid_async(
+        self,
+        item: "Item",
+        state: BidderState,
+        items_remaining: int,
+        weight_scheme: str = "linear",
+    ) -> float:
+        del weight_scheme
+        if state.remaining_budget <= 0:
+            return 0.0
+        prompt, min_required = self._build_bid_request(item, state, items_remaining)
+        bid = await self._call_llm_async(prompt)
+        return self._normalize_bid(bid, state, min_required)
 
 
 _PARAM_RANGES = {
@@ -675,6 +779,8 @@ def build_opponent_pool(
             else:
                 params[param] = rng.uniform(lo, hi)
 
-        bidders.append(cls(bidder_id=bidder_id, budget=bgt, **params))
+        bidder = cls(bidder_id=bidder_id, budget=bgt, **params)
+        bidder.set_seed(rng.randrange(2**63))
+        bidders.append(bidder)
 
     return bidders
