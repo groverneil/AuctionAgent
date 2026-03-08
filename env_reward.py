@@ -9,6 +9,7 @@ from typing import List, Dict, Any, Optional, Tuple, Union
 import json
 import numpy as np
 import os
+import random
 from tqdm import tqdm
 
 def _tqdm_disabled():
@@ -1066,8 +1067,11 @@ def train_rl_against_heuristics(
     model by eval performance. Restores best model at end to reduce variance.
     """
     if seed is not None:
+        random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
 
     if env.num_agents < 1 + len(heuristic_bidders):
         raise ValueError(

@@ -5,7 +5,13 @@ Usage:
     source venv/bin/activate
     python run_train.py
 """
+import os
+import random
+
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 import numpy as np
+import torch
 from typing import Dict, List
 from tqdm import tqdm
 from env_reward import (
@@ -31,6 +37,22 @@ SEEDS = [42, 123, 456]  # Multi-seed for variance reduction; first used for trai
 SEED = SEEDS[0]
 SAVE_MODEL = True
 SAVE_PATH = "auction_model.pt"
+
+
+def set_global_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if hasattr(torch, "use_deterministic_algorithms"):
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+set_global_seed(SEED)
 
 # ---- Create items with ranks (1 = most wanted) ----
 rng = np.random.default_rng(SEED)
@@ -70,7 +92,8 @@ opponent_bidders = build_opponent_pool(
 
 # ---- Train ----
 print(f"Training for {TRAIN_EPISODES} episodes against {N_OPPONENTS} heuristic opponents...")
-print(f"Items: {N_ITEMS}, Budget: {BUDGET}, Beta: {BETA}\n")
+print(f"Items: {N_ITEMS}, Budget: {BUDGET}, Beta: {BETA}")
+print(f"Deterministic seed: {SEED}\n")
 
 history = train_rl_against_heuristics(
     env=env,
