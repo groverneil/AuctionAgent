@@ -17,6 +17,7 @@ from env_reward import (
 from bidders import build_opponent_pool
 
 # ---- Config ----
+MODEL_TYPE = "lstm"  # "mlp" or "lstm"
 N_ITEMS = 20
 BUDGET = 10000
 N_OPPONENTS = 8
@@ -54,7 +55,8 @@ rl_agent = RLAgent(
     budget=BUDGET,
     beta=BETA,
     weight_scheme=WEIGHT_SCHEME,
-    lr=3e-4,  # Lower LR for stability (was 1e-3)
+    model_type=MODEL_TYPE,
+    lr=3e-4,
     gamma=0.99,
     epsilon_start=1.0,
     epsilon_end=0.05,
@@ -70,7 +72,7 @@ opponent_bidders = build_opponent_pool(
 
 # ---- Train ----
 print(f"Training for {TRAIN_EPISODES} episodes against {N_OPPONENTS} heuristic opponents...")
-print(f"Items: {N_ITEMS}, Budget: {BUDGET}, Beta: {BETA}\n")
+print(f"Model: {MODEL_TYPE}, Items: {N_ITEMS}, Budget: {BUDGET}, Beta: {BETA}\n")
 
 history = train_rl_against_heuristics(
     env=env,

@@ -16,7 +16,7 @@ def _tqdm_disabled():
 import torch
 from torch import optim
 from torch.distributions import Categorical
-from model import AuctionModel
+from model import AuctionModel, AuctionLSTMModel
 from scoring import score_priority_weighted, rank_to_weight
 from bidders import (
     BaseBidder,
@@ -134,14 +134,26 @@ class RLAgent(Agent):
         epsilon_start: float = 1.0,
         epsilon_end: float = 0.05,
         epsilon_decay: float = 0.995,
+        model_type: str = "lstm",  # "mlp" or "lstm"
     ):
         super().__init__(name, priority, valuations, budget, beta, weight_scheme)
-        model = AuctionModel(
-            input_size=2 * len(priority) + 6,  # +3 for items_remaining_norm, budget_fraction, rank_norm
-            hidden_size=128,
-            action_size=1 + len(RL_BID_FRACTIONS),
-        )
+        input_size = 2 * len(priority) + 6
+        action_size = 1 + len(RL_BID_FRACTIONS)
+        if model_type == "lstm":
+            model = AuctionLSTMModel(
+                input_size=input_size,
+                hidden_size=128,
+                action_size=action_size,
+                lstm_hidden_size=64,
+            )
+        else:
+            model = AuctionModel(
+                input_size=input_size,
+                hidden_size=128,
+                action_size=action_size,
+            )
         self.bind_model(model, "rl")
+        self._lstm_hidden = None  # (h, c) for LSTM; None = reset
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
         self.gamma = gamma
         self.epsilon = epsilon_start
@@ -149,6 +161,10 @@ class RLAgent(Agent):
         self.epsilon_decay = epsilon_decay
         self._return_baseline = 0.0  # Running mean for variance reduction
         self._baseline_momentum = 0.99
+
+    def reset_hidden(self) -> None:
+        """Reset LSTM hidden state (call at episode start)."""
+        self._lstm_hidden = None
 
     def get_action(self, state: np.ndarray, mask: Optional[np.ndarray] = None) -> int:
         state_batch = np.asarray(state, dtype=np.float32)
@@ -160,11 +176,16 @@ class RLAgent(Agent):
             if mask_t.dim() == 1:
                 mask_t = mask_t.unsqueeze(0)
         with torch.no_grad():
-            logits = self.model(
+            out = self.model(
                 torch.from_numpy(state_batch),
-                mask_t,
+                mask=mask_t,
+                hidden=self._lstm_hidden,
             )
-        action = int(logits.argmax(dim=1).item())
+            if isinstance(out, tuple):
+                probs, self._lstm_hidden = out
+            else:
+                probs = out
+        action = int(probs.argmax(dim=1).item())
         return action
 
     def sample_action(
@@ -185,7 +206,12 @@ class RLAgent(Agent):
                 mask_np = mask_np.reshape(1, -1)
             mask_t = torch.from_numpy(mask_np).float()
 
-        probs = self.model(torch.from_numpy(state_batch), mask_t).squeeze(0)
+        out = self.model(torch.from_numpy(state_batch), mask=mask_t, hidden=self._lstm_hidden)
+        if isinstance(out, tuple):
+            probs, self._lstm_hidden = out
+            probs = probs.squeeze(0)
+        else:
+            probs = out.squeeze(0)
         probs = torch.clamp(probs, min=1e-8, max=1.0)
         probs = probs / probs.sum()
         dist = Categorical(probs)
@@ -815,6 +841,10 @@ def _run_episode(
     rewards: List[float] = []
     log_probs: List[torch.Tensor] = []
     episode_events: List[Dict[str, Any]] = []
+
+    for a in env.agents:
+        if isinstance(a, RLAgent):
+            a.reset_hidden()
 
     while not done:
         acting_agent = env.get_current_bidder()

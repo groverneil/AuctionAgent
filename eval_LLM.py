@@ -36,6 +36,7 @@ def _call_llm_with_count(self, prompt: str):
 LLMBidder._call_llm = _call_llm_with_count
 
 # ---- Config (must match run_train.py) ----
+MODEL_TYPE = "lstm"  # Must match model used when training
 N_ITEMS = 20
 BUDGET = 10000
 N_OPPONENTS = 8
@@ -63,9 +64,10 @@ rl_agent = RLAgent(
     budget=BUDGET,
     beta=BETA,
     weight_scheme=WEIGHT_SCHEME,
+    model_type=MODEL_TYPE,
 )
 rl_agent.model.load_state_dict(torch.load(SAVE_PATH, weights_only=True))
-print(f"Loaded model weights from {SAVE_PATH}")
+print(f"Loaded {MODEL_TYPE} model from {SAVE_PATH}")
 
 # ---- Build environment ----
 env = AuctionEnvironment(
