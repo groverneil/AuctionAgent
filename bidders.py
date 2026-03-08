@@ -1,5 +1,8 @@
 from __future__ import annotations
+import importlib
+import os
 import random
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, TYPE_CHECKING
@@ -457,6 +460,132 @@ class RandomBidder(BaseBidder):
 
         cap = self.max_fraction * state.remaining_budget
         return random.uniform(0.0, cap)
+
+
+class LLMBidder(BaseBidder):
+    """
+    LLM-driven bidder using Triton AI API.
+
+    Uses a text prompt to ask an LLM for a numeric bid amount. Returns 0 (drop)
+    on parse/API failure. Clamps bid to [0, remaining_budget].
+    """
+
+    BASE_URL = "https://tritonai-api.ucsd.edu"
+    MODEL = "api-gpt-oss-120b"
+    BID_INCREMENT_RATIO = 0.1
+
+    def __init__(
+        self,
+        bidder_id: int,
+        budget: float,
+        beta: float = 1.0,
+        temperature: float = 0.1,
+        debug: bool = False,
+    ):
+        super().__init__(bidder_id, budget)
+        self.beta = beta
+        self.temperature = temperature
+        self.debug = debug
+        self._client = None
+
+    def _get_client(self):
+        try:
+            from dotenv import load_dotenv
+            load_dotenv()
+        except ImportError:
+            pass
+        api_key = os.getenv("API_KEY", "")
+        if not api_key:
+            raise ValueError("Missing API_KEY environment variable.")
+        if self._client is None:
+            openai_mod = importlib.import_module("openai")
+            OpenAI = getattr(openai_mod, "OpenAI")
+            self._client = OpenAI(api_key=api_key, base_url=self.BASE_URL)
+        return self._client
+
+    @staticmethod
+    def _extract_first_number(text: str) -> Optional[float]:
+        match = re.search(r"-?\d+(?:\.\d+)?", text)
+        if not match:
+            return None
+        try:
+            return float(match.group(0))
+        except ValueError:
+            return None
+
+    def _build_prompt(
+        self,
+        item: "Item",
+        state: BidderState,
+        items_remaining: int,
+        high_bid: float,
+        min_required: float,
+    ) -> str:
+        value = float(item.value)
+        bid_history = [float(x) for x in item.bids]
+        n = max(state.n_items, 1)
+        budget_frac = state.remaining_budget / state.budget if state.budget else 0.0
+        lines = [
+            f"You are bidding in a sequential auction of {n} items.",
+            "Your goal is to win as many items as possible.",
+            "Return ONLY one number (no words), the bid amount.",
+            "Return 0 to skip/drop out.",
+            "Bidding 0 wins nothing. If this is the last item, you could bid at least the minimum to have a chance to win. Only bid 0 if you truly do not want this item.",
+            "If bidding, choose a legal bid >= min_required and <= remaining budget.",
+            "",
+            f"The the current highest bid on the current item is {high_bid:.2f} and you have {state.remaining_budget:.2f} budget left.",
+            f"Minimum legal next bid: {min_required:.2f}",
+            f"Bid history (last 6): {bid_history[-6:]}",
+            f"Your remaining budget: {state.remaining_budget:.2f} (budget fraction: {budget_frac:.3f})",
+            f"Items remaining: {items_remaining} of {n}",
+        ]
+        lines.extend(["", "Output one numeric bid (0 or >= min_required):"])
+        return "\n".join(lines)
+
+    def _call_llm(self, prompt: str) -> Optional[float]:
+        try:
+            client = self._get_client()
+            resp = client.chat.completions.create(
+                model=self.MODEL,
+                temperature=self.temperature,
+                messages=[
+                    {"role": "system", "content": "Output only a numeric bid."},
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            raw = resp.choices[0].message.content if resp.choices else ""
+            return self._extract_first_number(raw or "")
+        except Exception as exc:
+            if self.debug:
+                print(f"[LLMBidder {self.bidder_id}] API error: {exc!r}")
+            return None
+
+    def place_bid(
+        self,
+        item: "Item",
+        state: BidderState,
+        items_remaining: int,
+        weight_scheme: str = "linear",
+    ) -> float:
+        if state.remaining_budget <= 0:
+            return 0.0
+        bid_history = [float(x) for x in item.bids]
+        high_bid = max(bid_history) if bid_history else 0.0
+        inc = self.BID_INCREMENT_RATIO * float(item.value)
+        min_required = high_bid + inc
+        prompt = self._build_prompt(item, state, items_remaining, high_bid, min_required)
+        bid = self._call_llm(prompt)
+        if bid is None:
+            if self.debug:
+                print(f"[LLMBidder {self.bidder_id}] Could not parse bid, dropping.")
+            return 0.0
+        if bid < 0:
+            return 0.0
+        if 0 < bid < min_required:
+            bid = min_required
+        if bid > state.remaining_budget:
+            bid = state.remaining_budget
+        return float(bid)
 
 
 _PARAM_RANGES = {

@@ -129,8 +129,10 @@ Eight opponent types from `bidders.py`, each with randomized parameters:
 ├── bidders.py       # Heuristic opponents
 ├── scoring.py       # Reward/scoring functions
 ├── run_train.py     # Single train + eval run
+├── eval_LLM.py      # Evaluate saved model vs LLM + heuristic opponents
 ├── bulk_log.py      # Parallel bulk runs
 ├── visualize.py     # Replay auction from JSON log
+├── .env.example     # Environment variable template (copy to .env)
 └── env.py           # Legacy/simpler env (unused)
 ```
 
@@ -142,7 +144,12 @@ Eight opponent types from `bidders.py`, each with randomized parameters:
 # Activate environment
 source venv/bin/activate
 
-# Single run (train + eval)
+# Set up your API key (required for LLMBidder / eval_LLM.py):
+cp .env.example .env
+# Then edit .env and replace the placeholder with your Triton AI API key
+
+# Single run (train + eval); saves model weights to auction_model.pt by default
+# Set SAVE_MODEL = False in run_train.py to disable
 python run_train.py
 
 # Bulk runs (10 seeds, parallel)

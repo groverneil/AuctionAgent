@@ -952,6 +952,8 @@ def train_rl_against_heuristics(
     seed: Optional[int] = None,
     checkpoint_every: int = 0,
     checkpoint_eval_n: int = 30,
+    save_model: bool = False,
+    save_path: str = "auction_model.pt",
 ) -> Dict[str, List[float]]:
     """
     Train one RL agent against heuristic bidders from `bidders.py`.
@@ -988,6 +990,8 @@ def train_rl_against_heuristics(
             update_rl=True,
             reset_each_episode=True,
         )
+        if save_model:
+            torch.save(rl_agent.model.state_dict(), save_path)
         return history
 
     history: Dict[str, Any] = {
@@ -1036,5 +1040,8 @@ def train_rl_against_heuristics(
         rl_agent.model.load_state_dict(best_state)
     if best_train_rounds_last50 is not None:
         history["best_train_rounds_last50"] = best_train_rounds_last50
+
+    if save_model:
+        torch.save(rl_agent.model.state_dict(), save_path)
 
     return history

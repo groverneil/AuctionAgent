@@ -29,6 +29,8 @@ CHECKPOINT_EVERY = 100  # Evaluate and save best model every N episodes (0 = off
 CHECKPOINT_EVAL_N = 50  # Auctions per checkpoint eval (higher = more stable best-model selection)
 SEEDS = [42, 123, 456]  # Multi-seed for variance reduction; first used for training
 SEED = SEEDS[0]
+SAVE_MODEL = True
+SAVE_PATH = "auction_model.pt"
 
 # ---- Create items with ranks (1 = most wanted) ----
 rng = np.random.default_rng(SEED)
@@ -78,6 +80,8 @@ history = train_rl_against_heuristics(
     seed=SEED,
     checkpoint_every=CHECKPOINT_EVERY,
     checkpoint_eval_n=CHECKPOINT_EVAL_N,
+    save_model=SAVE_MODEL,
+    save_path=SAVE_PATH,
 )
 
 # ---- Print training summary ----
@@ -167,3 +171,5 @@ for agent in env.agents[1:]:
     print(f"    Total score: {agent.accumulated_reward:.4f}")
 
 print(f"\nAuction log saved to auction_log.json")
+if SAVE_MODEL:
+    print(f"Model weights saved to {SAVE_PATH}")
