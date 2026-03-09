@@ -4,7 +4,10 @@ Train RL agent against heuristic bidders, then run an evaluation auction.
 Usage:
     source venv/bin/activate
     python run_train.py
+    python run_train.py --plot
 """
+import argparse
+import json
 import numpy as np
 from typing import Dict, List
 from tqdm import tqdm
@@ -15,6 +18,11 @@ from env_reward import (
     train_rl_against_heuristics,
 )
 from bidders import build_opponent_pool
+
+# ---- Args ----
+parser = argparse.ArgumentParser()
+parser.add_argument("--plot", action="store_true", help="Generate training/eval plots")
+args = parser.parse_args()
 
 # ---- Config ----
 N_ITEMS = 20
@@ -166,4 +174,30 @@ for agent in env.agents[1:]:
     print(f"    Budget left: {agent.remaining_budget:.2f}")
     print(f"    Total score: {agent.accumulated_reward:.4f}")
 
-print(f"\nAuction log saved to auction_log.json")
+# ---- Save results ----
+def _serialize(obj):
+    if isinstance(obj, dict):
+        return {k: _serialize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_serialize(x) for x in obj]
+    if isinstance(obj, (np.integer, np.floating)):
+        return float(obj)
+    return obj
+
+with open("training_results.json", "w", encoding="utf-8") as f:
+    json.dump({
+        "history": _serialize(history),
+        "eval": {"all_wins": all_wins, "n_rounds": n_rounds, "agent_heuristic": agent_heuristic},
+    }, f, indent=2)
+print(f"\nResults saved to training_results.json")
+
+if args.plot:
+    try:
+        from graphs import plot_training, plot_eval
+        plot_training(history, save=True, show=False)
+        plot_eval(all_wins, n_rounds, agent_heuristic, save=True, show=False)
+        print("Plots saved: training_curves.png, eval_results.png")
+    except ImportError as e:
+        print(f"Plotting skipped: {e}")
+
+print(f"Auction log saved to auction_log.json")

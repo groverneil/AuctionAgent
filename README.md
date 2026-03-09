@@ -129,6 +129,8 @@ Eight opponent types from `bidders.py`, each with randomized parameters:
 ├── bidders.py       # Heuristic opponents
 ├── scoring.py       # Reward/scoring functions
 ├── run_train.py     # Single train + eval run
+├── plot_training.py # CLI to plot results
+├── graphs.py        # Graphing (training curves, eval chart)
 ├── bulk_log.py      # Parallel bulk runs
 ├── visualize.py     # Replay auction from JSON log
 └── env.py           # Legacy/simpler env (unused)
@@ -151,6 +153,8 @@ python bulk_log.py
 # Replay auction (after run_train saves auction_log.json)
 python visualize.py auction_log.json
 # Or: python visualize.py auction_log.json --auto --delay 0.8
+
+# Plot: python run_train.py --plot  or  python plot_training.py
 ```
 
 ---
