@@ -227,7 +227,8 @@ class RandomBidder(BaseBidder):
 
 
 class LLMBidder(BaseBidder):
-    """LLM-driven bidder using Triton AI API."""
+    """LLM-driven bidder using Triton AI API. Binary 0/1 decision; if 1,
+    bids min_required (same increment logic as RL agent)."""
 
     BASE_URL = "https://tritonai-api.ucsd.edu"
     MODEL = "api-gpt-oss-120b"
@@ -274,56 +275,46 @@ class LLMBidder(BaseBidder):
         return self._async_client
 
     @staticmethod
-    def _extract_first_number(text: str) -> Optional[float]:
-        match = re.search(r"-?\d+(?:\.\d+)?", text)
-        if not match:
-            return None
-        try:
-            return float(match.group(0))
-        except ValueError:
-            return None
+    def _parse_binary(text: str) -> Optional[int]:
+        """Parse model response as 0 or 1."""
+        text = text.strip()
+        if text in ("0", "1"):
+            return int(text)
+        match = re.search(r"[01]", text)
+        return int(match.group(0)) if match else None
 
     def _build_prompt(self, item, state, items_remaining, high_bid, min_required):
-        value = float(item.value)
-        bid_history = [float(x) for x in item.bids]
         n = max(state.n_items, 1)
         budget_frac = state.remaining_budget / state.budget if state.budget else 0.0
         lines = [
-            f"You are bidding in a sequential auction of {n} items.",
-            "Your goal is to win as many items as possible.",
-            "Return ONLY one number (no words), the bid amount.",
-            "Return 0 to skip/drop out.",
-            "Bidding 0 wins nothing. If this is the last item, you could bid at least the minimum to have a chance to win. Only bid 0 if you truly do not want this item.",
-            "If bidding, choose a legal bid >= min_required and <= remaining budget.",
+            f"You are bidding in a sequential auction of {n} items against {n - 1} other bidders.",
+            "Your goal is to win as many items as possible while managing your budget.",
             "",
-            f"The the current highest bid on the current item is {high_bid:.2f} and you have {state.remaining_budget:.2f} budget left.",
-            f"Minimum legal next bid: {min_required:.2f}",
-            f"Bid history (last 6): {bid_history[-6:]}",
-            f"Your remaining budget: {state.remaining_budget:.2f} (budget fraction: {budget_frac:.3f})",
+            f"Current item: highest bid so far is {high_bid:.2f}.",
+            f"If you bid, your bid will be {min_required:.2f} (the minimum increment).",
+            f"Your remaining budget: {state.remaining_budget:.2f} (fraction: {budget_frac:.3f})",
             f"Items remaining: {items_remaining} of {n}",
             "",
-            "Output one numeric bid (0 or >= min_required):",
+            "Output 1 to bid (your bid = the minimum increment).",
+            "Output 0 to drop out of this item.",
+            "Output only 0 or 1:",
         ]
         return "\n".join(lines)
 
     def _request_messages(self, prompt):
         return [
-            {"role": "system", "content": "Output only a numeric bid."},
+            {"role": "system", "content": "Output only 0 or 1."},
             {"role": "user", "content": prompt},
         ]
 
-    def _parse_response_bid(self, resp) -> Optional[float]:
-        raw = resp.choices[0].message.content if resp.choices else ""
-        return self._extract_first_number(raw or "")
-
     def _call_llm_once(self, prompt):
-        client = self._get_client()
-        resp = client.chat.completions.create(
+        resp = self._get_client().chat.completions.create(
             model=self.MODEL,
             temperature=self.temperature,
             messages=self._request_messages(prompt),
         )
-        return self._parse_response_bid(resp)
+        raw = resp.choices[0].message.content if resp.choices else ""
+        return self._parse_binary(raw or "")
 
     def _call_llm(self, prompt):
         self.call_count += 1
@@ -342,7 +333,8 @@ class LLMBidder(BaseBidder):
                 temperature=self.temperature,
                 messages=self._request_messages(prompt),
             )
-            return self._parse_response_bid(resp)
+            raw = resp.choices[0].message.content if resp.choices else ""
+            return self._parse_binary(raw or "")
         except (ImportError, AttributeError, ModuleNotFoundError):
             try:
                 return await asyncio.to_thread(self._call_llm_once, prompt)
@@ -361,15 +353,10 @@ class LLMBidder(BaseBidder):
         min_required = high_bid + self.BID_INCREMENT_RATIO * float(item.value)
         return self._build_prompt(item, state, items_remaining, high_bid, min_required), min_required
 
-    def _normalize_bid(self, bid, state, min_required):
-        if bid is None:
-            if self.debug:
-                print(f"[LLMBidder {self.bidder_id}] Could not parse bid, dropping.")
+    def _decision_to_bid(self, decision, state, min_required):
+        if decision is None or decision == 0:
             return 0.0
-        if bid < 0:
-            return 0.0
-        if 0 < bid < min_required:
-            bid = min_required
+        bid = min_required
         if bid > state.remaining_budget:
             bid = state.remaining_budget
         return float(bid)
@@ -378,18 +365,25 @@ class LLMBidder(BaseBidder):
         if state.remaining_budget <= 0:
             return 0.0
         prompt, min_required = self._build_bid_request(item, state, items_remaining)
-        return self._normalize_bid(self._call_llm(prompt), state, min_required)
+        decision = self._call_llm(prompt)
+        if self.debug:
+            print(f"[LLMBidder {self.bidder_id}] item={item.name} decision={decision} min_req={min_required:.2f} budget={state.remaining_budget:.2f}")
+        return self._decision_to_bid(decision, state, min_required)
 
     async def place_bid_async(self, item, state, items_remaining, weight_scheme="linear"):
         del weight_scheme
         if state.remaining_budget <= 0:
             return 0.0
         prompt, min_required = self._build_bid_request(item, state, items_remaining)
-        return self._normalize_bid(await self._call_llm_async(prompt), state, min_required)
+        decision = await self._call_llm_async(prompt)
+        if self.debug:
+            print(f"[LLMBidder {self.bidder_id}] item={item.name} decision={decision} min_req={min_required:.2f} budget={state.remaining_budget:.2f}")
+        return self._decision_to_bid(decision, state, min_required)
 
 
 class LMStudioBidder(BaseBidder):
-    """LLM-driven bidder for LM Studio (localhost:1234)."""
+    """LLM-driven bidder for LM Studio (localhost:1234). Binary 0/1 decision;
+    if 1, bids min_required (same increment logic as RL agent)."""
 
     BASE_URL = "http://localhost:1234/v1"
     MODEL = "local"
@@ -424,47 +418,36 @@ class LMStudioBidder(BaseBidder):
         return self._async_client
 
     @staticmethod
-    def _extract_first_number(text: str) -> Optional[float]:
-        match = re.search(r"-?\d+(?:\.\d+)?", text)
-        if not match:
-            return None
-        try:
-            return float(match.group(0))
-        except ValueError:
-            return None
+    def _parse_binary(text: str) -> Optional[int]:
+        text = text.strip()
+        if text in ("0", "1"):
+            return int(text)
+        match = re.search(r"[01]", text)
+        return int(match.group(0)) if match else None
 
     def _build_prompt(self, item, state, items_remaining, high_bid, min_required):
-        value = float(item.value)
-        bid_history = [float(x) for x in item.bids]
         n = max(state.n_items, 1)
         budget_frac = state.remaining_budget / state.budget if state.budget else 0.0
         lines = [
-            f"You are bidding in a sequential auction of {n} items.",
-            "Your goal is to win as many items as possible.",
-            "Return ONLY one number (no words), the bid amount.",
-            "Return 0 to skip/drop out.",
-            "Bidding 0 wins nothing. If this is the last item, you could bid at least the minimum to have a chance to win. Only bid 0 if you truly do not want this item.",
-            "If bidding, choose a legal bid >= min_required and <= remaining budget.",
+            f"You are bidding in a sequential auction of {n} items against {n - 1} other bidders.",
+            "Your goal is to win as many items as possible while managing your budget.",
             "",
-            f"The current highest bid on the current item is {high_bid:.2f} and you have {state.remaining_budget:.2f} budget left.",
-            f"Minimum legal next bid: {min_required:.2f}",
-            f"Bid history (last 6): {bid_history[-6:]}",
-            f"Your remaining budget: {state.remaining_budget:.2f} (budget fraction: {budget_frac:.3f})",
+            f"Current item: highest bid so far is {high_bid:.2f}.",
+            f"If you bid, your bid will be {min_required:.2f} (the minimum increment).",
+            f"Your remaining budget: {state.remaining_budget:.2f} (fraction: {budget_frac:.3f})",
             f"Items remaining: {items_remaining} of {n}",
             "",
-            "Output one numeric bid (0 or >= min_required):",
+            "Output 1 to bid (your bid = the minimum increment).",
+            "Output 0 to drop out of this item.",
+            "Output only 0 or 1:",
         ]
         return "\n".join(lines)
 
     def _request_messages(self, prompt):
         return [
-            {"role": "system", "content": "Output only a numeric bid."},
+            {"role": "system", "content": "Output only 0 or 1."},
             {"role": "user", "content": prompt},
         ]
-
-    def _parse_response_bid(self, resp) -> Optional[float]:
-        raw = resp.choices[0].message.content if resp.choices else ""
-        return self._extract_first_number(raw or "")
 
     def _call_llm_once(self, prompt):
         t0 = time.perf_counter()
@@ -474,7 +457,8 @@ class LMStudioBidder(BaseBidder):
                 temperature=self.temperature,
                 messages=self._request_messages(prompt),
             )
-            out = self._parse_response_bid(resp)
+            raw = resp.choices[0].message.content if resp.choices else ""
+            out = self._parse_binary(raw or "")
             self.call_durations.append(time.perf_counter() - t0)
             return out
         except Exception:
@@ -499,13 +483,13 @@ class LMStudioBidder(BaseBidder):
                 temperature=self.temperature,
                 messages=self._request_messages(prompt),
             )
-            out = self._parse_response_bid(resp)
+            raw = resp.choices[0].message.content if resp.choices else ""
+            out = self._parse_binary(raw or "")
             self.call_durations.append(time.perf_counter() - t0)
             return out
         except (ImportError, AttributeError, ModuleNotFoundError):
             try:
-                out = await asyncio.to_thread(self._call_llm_once, prompt)
-                return out
+                return await asyncio.to_thread(self._call_llm_once, prompt)
             except Exception as exc:
                 if self.debug:
                     print(f"[LMStudioBidder {self.bidder_id}] API error: {exc!r}")
@@ -521,15 +505,10 @@ class LMStudioBidder(BaseBidder):
         min_required = high_bid + self.BID_INCREMENT_RATIO * float(item.value)
         return self._build_prompt(item, state, items_remaining, high_bid, min_required), min_required
 
-    def _normalize_bid(self, bid, state, min_required):
-        if bid is None:
-            if self.debug:
-                print(f"[LMStudioBidder {self.bidder_id}] Could not parse bid, dropping.")
+    def _decision_to_bid(self, decision, state, min_required):
+        if decision is None or decision == 0:
             return 0.0
-        if bid < 0:
-            return 0.0
-        if 0 < bid < min_required:
-            bid = min_required
+        bid = min_required
         if bid > state.remaining_budget:
             bid = state.remaining_budget
         return float(bid)
@@ -538,50 +517,37 @@ class LMStudioBidder(BaseBidder):
         if state.remaining_budget <= 0:
             return 0.0
         prompt, min_required = self._build_bid_request(item, state, items_remaining)
-        return self._normalize_bid(self._call_llm(prompt), state, min_required)
+        decision = self._call_llm(prompt)
+        if self.debug:
+            print(f"[LMStudioBidder {self.bidder_id}] item={item.name} decision={decision} min_req={min_required:.2f} budget={state.remaining_budget:.2f}")
+        return self._decision_to_bid(decision, state, min_required)
 
     async def place_bid_async(self, item, state, items_remaining, weight_scheme="linear"):
         del weight_scheme
         if state.remaining_budget <= 0:
             return 0.0
         prompt, min_required = self._build_bid_request(item, state, items_remaining)
-        return self._normalize_bid(await self._call_llm_async(prompt), state, min_required)
+        decision = await self._call_llm_async(prompt)
+        if self.debug:
+            print(f"[LMStudioBidder {self.bidder_id}] item={item.name} decision={decision} min_req={min_required:.2f} budget={state.remaining_budget:.2f}")
+        return self._decision_to_bid(decision, state, min_required)
 
 
 class MLXBidder(BaseBidder):
-    """
-    MLX-native bidder for gpt-oss-20b on Apple Silicon — no HTTP round-trip.
+    """MLX-native bidder for gpt-oss-20b on Apple Silicon — no HTTP round-trip.
+    Binary 0/1 decision; if 1, bids min_required (same as RL agent).
+    Model loaded once at class level, shared across instances.
 
-    Mirrors LMStudioBidder behaviour exactly:
-      - Identical prompt to LMStudioBidder
-      - Parses raw gpt-oss-20b channel-token output into (content, reasoning),
-        replicating what LM Studio returns in message.content / message.reasoning
-      - Never extracts numbers from the analysis channel (prevents budget-blowout)
-      - Identical call_count / call_durations tracking
-
-    Model is loaded once at class level and shared across all instances.
-
-    Raw model output format:
-        <|channel|>analysis<|message|>REASONING<|channel|>final<|message|>NUMBER
+    Raw model output: <|channel|>analysis<|message|>...<|channel|>final<|message|>0 or 1
     """
 
     MODEL_REPO = "mlx-community/gpt-oss-20b-MXFP4-Q4"
     BID_INCREMENT_RATIO = 0.1
-    # Must cover full analysis + final channel. Bump if you see
-    # "no final channel" warnings in debug mode.
-    MAX_TOKENS = 2048
 
     _model = None
     _tokenizer = None
 
-    def __init__(
-        self,
-        bidder_id: int,
-        budget: float,
-        beta: float = 1.0,
-        reasoning_effort: str = "low",  # "low" | "medium" | "high"
-        debug: bool = False,
-    ):
+    def __init__(self, bidder_id, budget, beta=1.0, reasoning_effort="low", debug=False):
         super().__init__(bidder_id, budget)
         self.beta = beta
         self.reasoning_effort = reasoning_effort
@@ -599,91 +565,55 @@ class MLXBidder(BaseBidder):
             print("[MLXBidder] Model loaded.")
 
     @staticmethod
-    def _extract_first_number(text: str) -> Optional[float]:
-        match = re.search(r"-?\d+(?:\.\d+)?", text)
-        if not match:
-            return None
-        try:
-            return float(match.group(0))
-        except ValueError:
-            return None
+    def _parse_binary(text: str) -> Optional[int]:
+        text = text.strip()
+        if text in ("0", "1"):
+            return int(text)
+        match = re.search(r"[01]", text)
+        return int(match.group(0)) if match else None
 
     @staticmethod
-    def _parse_lmstudio_equivalent(text: str) -> tuple[Optional[str], Optional[str]]:
-        """
-        Parse raw gpt-oss-20b output into (content, reasoning), replicating
-        exactly what LM Studio returns in message.content / message.reasoning.
-
-        Raw model format:
-            <|channel|>analysis<|message|>REASONING<|channel|>final<|message|>NUMBER
-
-        Returns:
-            content  — the final answer string (maps to message.content)
-            reasoning — the analysis text     (maps to message.reasoning)
-        Either may be None if the corresponding channel was not present.
-        """
-        ANALYSIS_TAG = "<|channel|>analysis<|message|>"
-        FINAL_TAG = "<|channel|>final<|message|>"
-
-        reasoning: Optional[str] = None
-        content: Optional[str] = None
-
-        analysis_start = text.find(ANALYSIS_TAG)
-        final_start = text.find(FINAL_TAG)
-
-        if analysis_start != -1 and final_start != -1:
-            reasoning = text[analysis_start + len(ANALYSIS_TAG):final_start].strip()
-
-        if final_start != -1:
-            raw_content = text[final_start + len(FINAL_TAG):].strip()
-            end = raw_content.find("<")
-            content = raw_content[:end].strip() if end != -1 else raw_content
-
-        return content, reasoning
+    def _extract_final_channel(text: str) -> Optional[str]:
+        """Extract content from <|channel|>final<|message|>..."""
+        marker = "<|channel|>final<|message|>"
+        idx = text.rfind(marker)
+        if idx == -1:
+            return None
+        rest = text[idx + len(marker):].strip()
+        end = rest.find("<")
+        return rest[:end].strip() if end != -1 else rest
 
     def _build_prompt(self, item, state, items_remaining, high_bid, min_required):
-        # Identical to LMStudioBidder._build_prompt
-        value = float(item.value)
-        bid_history = [float(x) for x in item.bids]
         n = max(state.n_items, 1)
         budget_frac = state.remaining_budget / state.budget if state.budget else 0.0
         lines = [
-            f"You are bidding in a sequential auction of {n} items.",
-            "Your goal is to win as many items as possible.",
-            "Return ONLY one number (no words), the bid amount.",
-            "Return 0 to skip/drop out.",
-            "Bidding 0 wins nothing. If this is the last item, you could bid at least the minimum to have a chance to win. Only bid 0 if you truly do not want this item.",
-            "If bidding, choose a legal bid >= min_required and <= remaining budget.",
+            f"You are bidding in a sequential auction of {n} items against {n - 1} other bidders.",
+            "Your goal is to win as many items as possible while managing your budget.",
             "",
-            f"The current highest bid on the current item is {high_bid:.2f} and you have {state.remaining_budget:.2f} budget left.",
-            f"Minimum legal next bid: {min_required:.2f}",
-            f"Bid history (last 6): {bid_history[-6:]}",
-            f"Your remaining budget: {state.remaining_budget:.2f} (budget fraction: {budget_frac:.3f})",
+            f"Current item: highest bid so far is {high_bid:.2f}.",
+            f"If you bid, your bid will be {min_required:.2f} (the minimum increment).",
+            f"Your remaining budget: {state.remaining_budget:.2f} (fraction: {budget_frac:.3f})",
             f"Items remaining: {items_remaining} of {n}",
             "",
-            "Output one numeric bid (0 or >= min_required):",
+            "Output 1 to bid (your bid = the minimum increment).",
+            "Output 0 to drop out of this item.",
+            "Output only 0 or 1:",
         ]
         return "\n".join(lines)
 
     def _format_prompt(self, prompt: str) -> str:
-        """
-        Apply chat template — equivalent to LMStudioBidder._request_messages.
-        reasoning_effort controls think-block length, matching LM Studio's setting.
-        """
         messages = [
             {
                 "role": "system",
-                "content": f"Reasoning: {self.reasoning_effort}\nOutput only a numeric bid.",
+                "content": f"Reasoning: {self.reasoning_effort}\nOutput only 0 or 1.",
             },
             {"role": "user", "content": prompt},
         ]
         return MLXBidder._tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
+            messages, tokenize=False, add_generation_prompt=True,
         )
 
-    def _call_mlx(self, prompt: str) -> Optional[float]:
+    def _call_mlx(self, prompt: str) -> Optional[int]:
         from mlx_lm import generate
         from mlx_lm.sample_utils import make_sampler
 
@@ -691,56 +621,30 @@ class MLXBidder(BaseBidder):
         t0 = time.perf_counter()
         try:
             formatted = self._format_prompt(prompt)
-            sampler = make_sampler(temp=0.0)  # greedy = fastest + deterministic
+            sampler = make_sampler(temp=0.0)
             raw = generate(
-                MLXBidder._model,
-                MLXBidder._tokenizer,
+                MLXBidder._model, MLXBidder._tokenizer,
                 prompt=formatted,
-                max_tokens=MLXBidder.MAX_TOKENS,
-                sampler=sampler,
-                verbose=False,
+                sampler=sampler, verbose=False,
             )
             self.call_durations.append(time.perf_counter() - t0)
 
             raw_text = raw.strip() if isinstance(raw, str) else raw.text.strip()
 
-            # Strip <think> block if present before channel tokens
-            if "<think>" in raw_text and "</think>" in raw_text:
-                raw_text = raw_text.split("</think>", 1)[-1].strip()
-            elif "<think>" in raw_text:
+            # Try final channel first
+            content = self._extract_final_channel(raw_text)
+            if content is not None:
+                decision = self._parse_binary(content)
                 if self.debug:
-                    print(
-                        f"[MLXBidder {self.bidder_id}] WARNING: truncated <think> block "
-                        f"— increase MAX_TOKENS (currently {MLXBidder.MAX_TOKENS})"
-                    )
-                return None
+                    print(f"[MLXBidder {self.bidder_id}] final_channel={repr(content)} -> decision={decision} ({self.call_durations[-1]:.2f}s)")
+                return decision
 
-            # Split into content + reasoning, exactly as LM Studio does
-            content, reasoning = MLXBidder._parse_lmstudio_equivalent(raw_text)
-
-            if content is None:
-                # Model didn't reach the final channel — MAX_TOKENS too low,
-                # or unexpected output format. Never guess from analysis text.
-                if self.debug:
-                    print(
-                        f"[MLXBidder {self.bidder_id}] WARNING: no final channel "
-                        f"— increase MAX_TOKENS (currently {MLXBidder.MAX_TOKENS})\n"
-                        f"  raw={repr(raw_text[:200])}"
-                    )
-                return None
-
+            # No final channel — try parsing whole response
+            decision = self._parse_binary(raw_text)
             if self.debug:
-                print(
-                    f"[MLXBidder {self.bidder_id}] "
-                    f"content={repr(content)} "
-                    f"reasoning={repr((reasoning or '')[:80])}... "
-                    f"({self.call_durations[-1]:.2f}s)"
-                )
-
-            try:
-                return float(content)
-            except ValueError:
-                return MLXBidder._extract_first_number(content)
+                preview = repr(raw_text)[:120]
+                print(f"[MLXBidder {self.bidder_id}] no final channel, raw={preview} -> decision={decision} ({self.call_durations[-1]:.2f}s)")
+            return decision
 
         except Exception as exc:
             self.call_durations.append(time.perf_counter() - t0)
@@ -754,15 +658,10 @@ class MLXBidder(BaseBidder):
         min_required = high_bid + self.BID_INCREMENT_RATIO * float(item.value)
         return self._build_prompt(item, state, items_remaining, high_bid, min_required), min_required
 
-    def _normalize_bid(self, bid, state, min_required):
-        if bid is None:
-            if self.debug:
-                print(f"[MLXBidder {self.bidder_id}] Could not parse bid, dropping.")
+    def _decision_to_bid(self, decision, state, min_required):
+        if decision is None or decision == 0:
             return 0.0
-        if bid < 0:
-            return 0.0
-        if 0 < bid < min_required:
-            bid = min_required
+        bid = min_required
         if bid > state.remaining_budget:
             bid = state.remaining_budget
         return float(bid)
@@ -771,17 +670,21 @@ class MLXBidder(BaseBidder):
         if state.remaining_budget <= 0:
             return 0.0
         prompt, min_required = self._build_bid_request(item, state, items_remaining)
-        return self._normalize_bid(self._call_mlx(prompt), state, min_required)
+        decision = self._call_mlx(prompt)
+        if self.debug:
+            print(f"[MLXBidder {self.bidder_id}] item={item.name} decision={decision} min_req={min_required:.2f} budget={state.remaining_budget:.2f}")
+        return self._decision_to_bid(decision, state, min_required)
 
     async def place_bid_async(self, item, state, items_remaining, weight_scheme="linear"):
-        """MLX generate is synchronous — offload to thread to avoid blocking the event loop."""
+        """MLX generate is synchronous — offload to thread."""
         del weight_scheme
         if state.remaining_budget <= 0:
             return 0.0
         prompt, min_required = self._build_bid_request(item, state, items_remaining)
-        return self._normalize_bid(
-            await asyncio.to_thread(self._call_mlx, prompt), state, min_required
-        )
+        decision = await asyncio.to_thread(self._call_mlx, prompt)
+        if self.debug:
+            print(f"[MLXBidder {self.bidder_id}] item={item.name} decision={decision} min_req={min_required:.2f} budget={state.remaining_budget:.2f}")
+        return self._decision_to_bid(decision, state, min_required)
 
 
 _PARAM_RANGES = {
