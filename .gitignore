@@ -1,3 +1,6 @@
 *.log
 *.pyc
 *.json
+*.pt
+venv
+.env

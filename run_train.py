@@ -8,7 +8,13 @@ Usage:
 """
 import argparse
 import json
+import os
+import random
+
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 import numpy as np
+import torch
 from typing import Dict, List
 from tqdm import tqdm
 from env_reward import (
@@ -37,6 +43,24 @@ CHECKPOINT_EVERY = 100  # Evaluate and save best model every N episodes (0 = off
 CHECKPOINT_EVAL_N = 50  # Auctions per checkpoint eval (higher = more stable best-model selection)
 SEEDS = [42, 123, 456]  # Multi-seed for variance reduction; first used for training
 SEED = SEEDS[0]
+SAVE_MODEL = True
+SAVE_PATH = "auction_model.pt"
+
+
+def set_global_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if hasattr(torch, "use_deterministic_algorithms"):
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+set_global_seed(SEED)
 
 # ---- Create items with ranks (1 = most wanted) ----
 rng = np.random.default_rng(SEED)
@@ -76,7 +100,8 @@ opponent_bidders = build_opponent_pool(
 
 # ---- Train ----
 print(f"Training for {TRAIN_EPISODES} episodes against {N_OPPONENTS} heuristic opponents...")
-print(f"Items: {N_ITEMS}, Budget: {BUDGET}, Beta: {BETA}\n")
+print(f"Items: {N_ITEMS}, Budget: {BUDGET}, Beta: {BETA}")
+print(f"Deterministic seed: {SEED}\n")
 
 history = train_rl_against_heuristics(
     env=env,
@@ -86,6 +111,8 @@ history = train_rl_against_heuristics(
     seed=SEED,
     checkpoint_every=CHECKPOINT_EVERY,
     checkpoint_eval_n=CHECKPOINT_EVAL_N,
+    save_model=SAVE_MODEL,
+    save_path=SAVE_PATH,
 )
 
 # ---- Print training summary ----
@@ -200,4 +227,6 @@ if args.plot:
     except ImportError as e:
         print(f"Plotting skipped: {e}")
 
-print(f"Auction log saved to auction_log.json")
+print(f"\nAuction log saved to auction_log.json")
+if SAVE_MODEL:
+    print(f"Model weights saved to {SAVE_PATH}")
